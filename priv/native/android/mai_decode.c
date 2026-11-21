@@ -156,9 +156,12 @@ static const char *be_decode(const char *path, mai_pcm *pcm, int32_t *rate, char
         snprintf(detail, detail_n, "%s", strerror(errno));
         return "not_found";
     }
-    struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-        snprintf(detail, detail_n, "not a regular file");
+    /* fstat64: a 32-bit off_t can't hold a file over 2 GiB (EOVERFLOW);
+     * such a file decodes until the cap (too_large) like any other. */
+    struct stat64 st;
+    int stat_rc = fstat64(fd, &st);
+    if (stat_rc != 0 || !S_ISREG(st.st_mode)) {
+        snprintf(detail, detail_n, "%s", stat_rc != 0 ? strerror(errno) : "not a regular file");
         close(fd);
         return "not_found";
     }
@@ -167,7 +170,7 @@ static const char *be_decode(const char *path, mai_pcm *pcm, int32_t *rate, char
         close(fd);
         return "no_memory";
     }
-    media_status_t ms = M.exSetDataSourceFd(ex, fd, 0, st.st_size);
+    media_status_t ms = M.exSetDataSourceFd(ex, fd, 0, (off64_t)st.st_size);
     if (ms != AMEDIA_OK) {
         snprintf(detail, detail_n, "AMediaExtractor_setDataSourceFd: %d", (int)ms);
         M.exDelete(ex);

@@ -90,6 +90,8 @@ typedef struct {
     int32_t limit;         /* ... and the most left over after a callback before the excess is dropped */
     bool primed;           /* duplex: the input has delivered a block and the cushion */
     _Atomic int32_t waiting; /* duplex: frames left in the ring after the last callback (be_latency) */
+    int32_t started_id;      /* the stream (s->id) that has started once here: a later be_open is a reopen */
+    int32_t out_xruns;       /* the output stream's own underruns that be_tune has answered */
 } android_side;
 
 static android_side g_side[MAI_MAX_STREAMS];
@@ -346,7 +348,10 @@ static bool parse_device(mai_stream *s, const char *want, const char *what, int3
 
 /* What needs Java before a stream opens: RECORD_AUDIO for input, and that
  * the devices asked for are AudioManager's. Without Java (no JVM or
- * activity) AAudio's open decides instead. */
+ * activity) AAudio's open decides instead. A device that's gone fails the
+ * first open with "invalid_device"; on a reopen (the device was unplugged,
+ * and Android gives it a new id when it comes back) that side falls back to
+ * the system's route, said in last_error, so the stream keeps playing. */
 static const char *java_checks(mai_stream *s, int32_t *out_dev, int32_t *in_dev) {
     const char *out_want = (s->dir & MAI_DIR_OUT) ? s->want_device : "";
     const char *in_want = s->dir == MAI_DIR_IN ? s->want_device : s->dir == MAI_DIR_DUPLEX ? s->want_in_device : "";
@@ -359,20 +364,30 @@ static const char *java_checks(mai_stream *s, int32_t *out_dev, int32_t *in_dev)
         jni_done(attached);
         return NULL;
     }
+    bool reopen = side_of(s)->started_id == s->id;
     const char *err = NULL;
     char buf[MAI_ERRMAX];
     if ((*j)->PushLocalFrame(j, 16) == JNI_OK) {
         if ((s->dir & MAI_DIR_IN) && !mic_permitted(j)) {
             mai__set_error(s, "android.permission.RECORD_AUDIO is not granted");
             err = "permission";
-        } else if (*out_dev && device_listed(j, GET_DEVICES_OUTPUTS, *out_dev) == 0) {
-            snprintf(buf, sizeof buf, "no output device %d (AudioManager.getDevices)", (int)*out_dev);
-            mai__set_error(s, buf);
-            err = "invalid_device";
-        } else if (*in_dev && device_listed(j, GET_DEVICES_INPUTS, *in_dev) == 0) {
-            snprintf(buf, sizeof buf, "no input device %d (AudioManager.getDevices)", (int)*in_dev);
-            mai__set_error(s, buf);
-            err = "invalid_device";
+        } else {
+            bool out_gone = *out_dev && device_listed(j, GET_DEVICES_OUTPUTS, *out_dev) == 0;
+            bool in_gone = *in_dev && device_listed(j, GET_DEVICES_INPUTS, *in_dev) == 0;
+            if (out_gone || in_gone) {
+                int32_t gone = out_gone ? *out_dev : *in_dev;
+                const char *side = out_gone ? "output" : "input";
+                if (reopen) {
+                    snprintf(buf, sizeof buf, "%s device %d gone: using the system's route%s", side, (int)gone,
+                             out_gone && in_gone ? " (input too)" : "");
+                    if (out_gone) *out_dev = 0;
+                    if (in_gone) *in_dev = 0;
+                } else {
+                    snprintf(buf, sizeof buf, "no %s device %d (AudioManager.getDevices)", side, (int)gone);
+                    err = "invalid_device";
+                }
+                mai__set_error(s, buf);
+            }
         }
         (*j)->PopLocalFrame(j, NULL);
     } else {
@@ -484,6 +499,7 @@ static const char *be_open(mai_stream *s) {
         return "unavailable";
     }
     atomic_store(&d->waiting, 0);
+    d->out_xruns = 0; /* a new platform stream counts from 0 */
     /* AAudioStream_getTimestamp only from API 31 (see be_latency) */
     s->present = g_api >= 31 ? MAI_PRESENT_TIMESTAMP : MAI_PRESENT_ESTIMATE;
     s->be = want_out ? o : i;
@@ -502,6 +518,7 @@ static const char *be_start(mai_stream *s) {
         set_aaudio_error(s, "start", r);
         return "unavailable";
     }
+    side_of(s)->started_id = s->id;
     return NULL;
 }
 
@@ -519,12 +536,16 @@ static int32_t be_xruns(mai_stream *s) {
     return x;
 }
 
-/* After new underruns: a burst more of output buffer, up to the capacity
- * (Magpie's tune_buffer). An app that asked for a fixed size keeps it; an
- * input's buffer is AAudio's. */
+/* After new xruns: a burst more of output buffer, up to the capacity
+ * (Magpie's tune_buffer), but only for the output's own underruns: an
+ * input overrun (counted in be_xruns too) says nothing about the output's
+ * buffer. An app that asked for a fixed size keeps it. */
 static void be_tune(mai_stream *s) {
     AAudioStream *st = s->be;
     if (!st || !(s->dir & MAI_DIR_OUT) || s->want_frames > 0 || s->burst <= 0) return;
+    int32_t x = A.getXRunCount(st);
+    if (x <= side_of(s)->out_xruns) return;
+    side_of(s)->out_xruns = x;
     int32_t size = A.getBufferSizeInFrames(st);
     if (size + s->burst <= s->capacity) {
         A.setBufferSizeInFrames(st, size + s->burst);
