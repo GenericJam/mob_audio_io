@@ -28,3 +28,16 @@
 - `MobAudioIo.devices/1`, `MobAudioIo.decode/2`; the Fake decodes WAV.
 - `MobAudioIo.SelfTest` checks output and, when the microphone is
   permitted, input.
+* Android: AAudio input with presets (default, generic, performance,
+  unprocessed, voice) and device selection, duplex (input read as 16-bit in
+  the output callback through a ring), `RECORD_AUDIO` check, `devices/1`
+  through `AudioManager`, `decode/2` through `AMediaCodec`.
+* iOS: RemoteIO input (VoiceProcessingIO for `:voice`), duplex in one unit,
+  the session configured from all open streams, preferred input by port UID,
+  microphone permission check, `devices/1`, `decode/2` through ExtAudioFile.
+* A stream lost within 1 s of each start backs off (0.5 s to 8 s) instead
+  of reopening at once; an explicit Android device that disappears falls
+  back to the system's route on reopen.
+* Manifest: `RECORD_AUDIO` and `NSMicrophoneUsageDescription`.
+* CI: the C core under ASan+UBSan and TSan; the Apple C parts against real
+  CoreAudio on macOS.

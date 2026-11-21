@@ -30,8 +30,6 @@ defmodule AudioIoSpike.App do
 
     Mob.Screen.start_root(AudioIoSpike.HomeScreen)
     Mob.Dist.ensure_started(node: :"audio_io_spike_android@127.0.0.1", cookie: :mob_secret)
-    # The spike's measurement when Documents/mai_probe_request exists (iPhone, no dist).
-    AudioIoSpike.Probe.maybe_run_from_file()
   end
 
   # Returns the path to the migrations directory for the current environment.

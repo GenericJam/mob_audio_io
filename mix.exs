@@ -16,7 +16,7 @@ defmodule MobAudioIo.MixProject do
       package: package(),
       docs: [
         main: "MobAudioIo",
-        extras: ["README.md", "SPIKE.md"]
+        extras: ["README.md", "CHANGELOG.md", "docs/VERIFICATION.md"]
       ],
       source_url: @source_url
     ]

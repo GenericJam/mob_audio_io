@@ -1,6 +1,6 @@
 /*
  * c_src/spike_dsp.c: the example app's own C (a static NIF, mob.exs
- * :static_nifs, archs: [:all]). It registers two processors into
+ * :static_nifs, archs: [:all]). It registers its processors into
  * mob_audio_io from its load(), through the plugin's C ABI:
  *
  *   "spike_click"      a 1 kHz blip every half second; each click posts
@@ -9,6 +9,9 @@
  *                      of magpie/c_src/sampler.c at f397b7b) rendered by
  *                      sp_render; count_in/2 plays its metronome clicks, and
  *                      its engine events are posted to the owner.
+ *   "tone_loop",       the verification's (verify_dsp.c): a known tone
+ *   "loop_latency"     heard back through the mic, and the acoustic round
+ *                      trip of a burst.
  *
  * The header comes by a relative path: the plugin manifest can't export an
  * include path (MOB-541). This example uses the plugin as a path dependency
@@ -21,6 +24,7 @@
 
 #include "../../priv/include/mob_audio_io.h"
 #include "magpie/sampler.c"
+#include "verify_dsp.c"
 
 /* ── spike_click ───────────────────────────────────────────────────────── */
 
@@ -91,13 +95,16 @@ static void sampler_event(void *ctx, int32_t stream, int32_t event, const mai_ti
 
 /* ── NIFs ──────────────────────────────────────────────────────────────── */
 
-static int32_t reg_click = 1, reg_sampler = 1;
+static int32_t reg_click = 1, reg_sampler = 1, reg_tone = 1, reg_latency = 1;
+
+static ERL_NIF_TERM reg_term(ErlNifEnv *env, const char *name, int32_t r) {
+    return enif_make_tuple2(env, enif_make_atom(env, name), enif_make_int(env, r));
+}
 
 static ERL_NIF_TERM nif_registered(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc; (void)argv;
-    return enif_make_list2(
-        env, enif_make_tuple2(env, enif_make_atom(env, "spike_click"), enif_make_int(env, reg_click)),
-        enif_make_tuple2(env, enif_make_atom(env, "magpie_sampler"), enif_make_int(env, reg_sampler)));
+    return enif_make_list4(env, reg_term(env, "spike_click", reg_click), reg_term(env, "magpie_sampler", reg_sampler),
+                           reg_term(env, "tone_loop", reg_tone), reg_term(env, "loop_latency", reg_latency));
 }
 
 /* abi() -> the linked plugin's MAI_ABI_VERSION (a call into plugin C) */
@@ -134,9 +141,13 @@ static int load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     (void)env; (void)priv; (void)info;
     static const mai_processor click = {click_render, NULL, click_event};
     static const mai_processor sampler = {sampler_render, NULL, sampler_event};
+    static const mai_processor tone = {tone_render, tone_capture, NULL};
+    static const mai_processor latency = {latency_render, latency_capture, latency_event};
     sp_init(&SP, 48000);
     reg_click = mai_register("spike_click", &click, &CLICK);
     reg_sampler = mai_register("magpie_sampler", &sampler, &SP);
+    reg_tone = mai_register("tone_loop", &tone, &TONE);
+    reg_latency = mai_register("loop_latency", &latency, &LAT);
     return 0;
 }
 
@@ -145,6 +156,8 @@ static ErlNifFunc funcs[] = {
     {"abi", 0, nif_abi, 0},
     {"count_in", 2, nif_count_in, 0},
     {"stats", 0, nif_stats, 0},
+    {"tone", 1, nif_tone, 0},
+    {"pitch", 1, nif_pitch, ERL_NIF_DIRTY_JOB_CPU_BOUND},
 };
 
 ERL_NIF_INIT(spike_dsp, funcs, load, NULL, NULL, NULL)
