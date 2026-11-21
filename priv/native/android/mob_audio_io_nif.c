@@ -13,8 +13,9 @@
  *   - Input: a callback stream with the input preset asked for.
  *   - Duplex: an output stream with the callback and an input stream
  *     without one, at the output's rate, started first. The output callback
- *     reads all the input has, without blocking, into a ring allocated at
- *     open, and takes its block from there once a cushion of an input burst
+ *     reads all the input has, without blocking and as 16-bit (see
+ *     try_open), into a ring allocated at open, and takes its block from
+ *     there once a cushion of an input burst
  *     has built up; a short block is zero-filled (input_underflows), a
  *     backlog over about a buffer is dropped back to the cushion.
  *   - A disconnect (headphones in or out, a USB device) or any other error
@@ -82,6 +83,7 @@ typedef struct {
     float *ring;           /* duplex: the input read so far and not yet processed */
     int32_t ring_frames;
     int64_t ring_w, ring_r; /* frames written into / taken out of the ring */
+    int16_t *stage;        /* duplex: what one AAudioStream_read returns (16-bit, see try_open) */
     float *block;          /* duplex: one block of input, contiguous, for capture */
     int32_t block_frames;
     int32_t keep;          /* duplex: the cushion of input kept behind the output (an input burst) */
@@ -190,15 +192,17 @@ static aaudio_data_callback_result_t on_in_data(AAudioStream *st, void *user, vo
 }
 
 /* Duplex: everything the input (be2, no callback) has, read without
- * blocking into the ring, as far as it has room. */
+ * blocking into the ring as floats, as far as it has room. */
 static void ring_read(AAudioStream *in, android_side *d, int32_t ich) {
     for (;;) {
         int32_t space = d->ring_frames - (int32_t)(d->ring_w - d->ring_r);
         int32_t at = (int32_t)(d->ring_w % d->ring_frames);
         int32_t c = space < d->ring_frames - at ? space : d->ring_frames - at;
         if (c <= 0) return;
-        int32_t r = A.read(in, d->ring + (size_t)at * (size_t)ich, c, 0);
+        int32_t r = A.read(in, d->stage, c, 0);
         if (r <= 0) return;
+        float *dst = d->ring + (size_t)at * (size_t)ich;
+        for (int32_t k = 0; k < r * ich; k++) dst[k] = d->stage[k] * (1.0f / 32768.0f);
         d->ring_w += r;
         if (r < c) return;
     }
@@ -277,7 +281,12 @@ static aaudio_input_preset_t input_preset(int preset) {
 
 /* One AAudio stream: `cb` its data callback (NULL: read with
  * AAudioStream_read), at `rate` (0: the device's) on `device` (0: the
- * system's choice). */
+ * system's choice). Float, except an input read without a callback:
+ * that's 16-bit, because AAudio's legacy path (AudioStreamRecord, every
+ * release to date) reads a low-latency float input through an I16
+ * conversion buffer and, when a non-blocking read asks for more than has
+ * arrived, answers 0 and drops what it had read. 16-bit reads go straight
+ * to AudioRecord::read, which returns the partial read. */
 static aaudio_result_t try_open(mai_stream *s, aaudio_direction_t dir, AAudioStream_dataCallback cb, int32_t rate,
                                 int32_t device, aaudio_sharing_mode_t mode, AAudioStream **out) {
     AAudioStreamBuilder *b;
@@ -285,7 +294,7 @@ static aaudio_result_t try_open(mai_stream *s, aaudio_direction_t dir, AAudioStr
     if (r != AAUDIO_OK) return r;
     bool input = dir == AAUDIO_DIRECTION_INPUT;
     A.setDirection(b, dir);
-    A.setFormat(b, AAUDIO_FORMAT_PCM_FLOAT);
+    A.setFormat(b, input && !cb ? AAUDIO_FORMAT_PCM_I16 : AAUDIO_FORMAT_PCM_FLOAT);
     A.setChannelCount(b, input ? s->want_in_channels : s->want_channels);
     A.setSampleRate(b, rate > 0 ? rate : AAUDIO_UNSPECIFIED);
     A.setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
@@ -381,8 +390,10 @@ static void close_streams(AAudioStream *out, AAudioStream *in) {
 
 static void duplex_free(android_side *d) {
     free(d->ring);
+    free(d->stage);
     free(d->block);
     d->ring = d->block = NULL;
+    d->stage = NULL;
     d->ring_frames = d->block_frames = 0;
 }
 
@@ -400,8 +411,9 @@ static bool duplex_alloc(mai_stream *s, android_side *d) {
     d->ring_w = d->ring_r = 0;
     d->primed = false;
     d->ring = malloc(sizeof(float) * (size_t)d->ring_frames * (size_t)s->in_channels);
+    d->stage = malloc(sizeof(int16_t) * (size_t)d->ring_frames * (size_t)s->in_channels);
     d->block = malloc(sizeof(float) * (size_t)block * (size_t)s->in_channels);
-    if (d->ring && d->block) return true;
+    if (d->ring && d->stage && d->block) return true;
     duplex_free(d);
     return false;
 }
