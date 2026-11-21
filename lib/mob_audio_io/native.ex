@@ -6,20 +6,23 @@ defmodule MobAudioIo.Native do
   """
   @behaviour MobAudioIo.Backend
 
+  @native_keys [
+    :rate,
+    :frames,
+    :channels,
+    :input_channels,
+    :sharing,
+    :session,
+    :preset,
+    :device,
+    :input_device
+  ]
+
   @impl true
   def open(owner, direction, opts) do
     native(fn ->
       MobAudioIo.Log.attach()
-
-      :mob_audio_io_nif.open(
-        owner,
-        direction,
-        opts.processor,
-        opts.rate,
-        opts.frames,
-        opts.sharing,
-        opts.session
-      )
+      :mob_audio_io_nif.open(owner, direction, opts.processor, Map.take(opts, @native_keys))
     end)
   end
 
@@ -37,6 +40,13 @@ defmodule MobAudioIo.Native do
 
   @impl true
   def processors, do: native(&:mob_audio_io_nif.processors/0)
+
+  @impl true
+  def devices(direction), do: native(fn -> :mob_audio_io_nif.devices(direction) end)
+
+  @impl true
+  def decode(path, max_bytes, mono),
+    do: native(fn -> :mob_audio_io_nif.decode(path, max_bytes, mono) end)
 
   @doc "Whether the NIF is linked into this build."
   @spec available?() :: boolean()
