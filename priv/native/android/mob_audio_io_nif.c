@@ -70,8 +70,6 @@ static const char *be_load(void) {
     S(setSampleRate, "AAudioStreamBuilder_setSampleRate");
     S(setPerformanceMode, "AAudioStreamBuilder_setPerformanceMode");
     S(setSharingMode, "AAudioStreamBuilder_setSharingMode");
-    S(setUsage, "AAudioStreamBuilder_setUsage");
-    S(setContentType, "AAudioStreamBuilder_setContentType");
     S(setDataCallback, "AAudioStreamBuilder_setDataCallback");
     S(setErrorCallback, "AAudioStreamBuilder_setErrorCallback");
     S(openStream, "AAudioStreamBuilder_openStream");
@@ -92,6 +90,9 @@ static const char *be_load(void) {
     S(getDeviceId, "AAudioStream_getDeviceId");
     S(convertResultToText, "AAudio_convertResultToText");
 #undef S
+    /* API 28+: optional, so API 26/27 still open streams */
+    *(void **)&a.setUsage = dlsym(a.h, "AAudioStreamBuilder_setUsage");
+    *(void **)&a.setContentType = dlsym(a.h, "AAudioStreamBuilder_setContentType");
     A = a;
     return NULL;
 fail: /* a library without one of them: as if there were none */
@@ -127,8 +128,8 @@ static aaudio_result_t try_open(mai_stream *s, aaudio_sharing_mode_t mode, AAudi
     A.setSampleRate(b, s->want_rate > 0 ? s->want_rate : AAUDIO_UNSPECIFIED);
     A.setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     A.setSharingMode(b, mode);
-    A.setUsage(b, AAUDIO_USAGE_MEDIA);
-    A.setContentType(b, AAUDIO_CONTENT_TYPE_MUSIC);
+    if (A.setUsage) A.setUsage(b, AAUDIO_USAGE_MEDIA);
+    if (A.setContentType) A.setContentType(b, AAUDIO_CONTENT_TYPE_MUSIC);
     A.setDataCallback(b, on_data, s);
     A.setErrorCallback(b, on_error, s);
     r = A.openStream(b, out);

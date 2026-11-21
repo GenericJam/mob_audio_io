@@ -142,6 +142,7 @@ static void notify(ErlNifEnv *env, bool from_thread, mai_stream *s, const char *
         if (from_thread) {
             ERL_NIF_TERM copy = enif_make_copy(g_log_env, msg);
             enif_send(NULL, &logger, g_log_env, copy);
+            enif_clear_env(g_log_env); /* (a failed send leaves the copy) */
         } else {
             enif_send(env, &logger, NULL, msg);
         }
@@ -236,12 +237,13 @@ static void handle_pending_locked(ErlNifEnv *env, mai_stream *s, uint32_t pf, in
     if (pf & (MAI_PF_ROUTE | MAI_PF_RESET)) {
         /* ROUTE alone: a new route at the same rate (the unit follows it).
          * ROUTE|RESET: the rate changed; RESET alone: media services were
-         * reset. Both need the platform stream rebuilt. */
+         * reset. Both need the platform stream rebuilt, and only then does
+         * the processor hear of it: stream_event never runs beside render. */
         const char *why = !(pf & MAI_PF_RESET) ? "new_route" : (pf & MAI_PF_ROUTE) ? "new_rate" : "media_reset";
-        mai__event(s, MAI_EVENT_ROUTE_CHANGED);
         notify(env, true, s, "route_changed", reason_info(env, why), true);
         if ((pf & MAI_PF_RESET) && !s->interrupted) {
             stop_stream_locked(s);
+            mai__event(s, MAI_EVENT_ROUTE_CHANGED);
             try_reopen_locked(env, s, now, "route_changed");
         }
     }
@@ -515,7 +517,7 @@ static ERL_NIF_TERM nif_abi_version(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 static int nif_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     (void)priv; (void)info;
     ErlNifResourceTypeInit init = {.dtor = NULL, .stop = NULL, .down = mon_down};
-    g_mon_type = enif_open_resource_type_x(env, "mai_mon", &init, ERL_NIF_RT_CREATE, NULL);
+    g_mon_type = enif_open_resource_type_x(env, "mai_mon", &init, ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER, NULL);
     if (!g_mon_type) return 1;
     mai__register_builtins();
     if (!g_log_env) g_log_env = enif_alloc_env();
@@ -540,7 +542,7 @@ static ErlNifFunc nif_funcs[] = {
     {"stream_status", 1, nif_stream_status, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"reset_stats", 1, nif_reset_stats, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"processors", 0, nif_processors, 0},
-    {"set_logger", 1, nif_set_logger, 0},
+    {"set_logger", 1, nif_set_logger, ERL_NIF_DIRTY_JOB_IO_BOUND}, /* takes g_lock */
     {"abi_version", 0, nif_abi_version, 0},
 };
 

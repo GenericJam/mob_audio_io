@@ -57,8 +57,8 @@ defmodule MobAudioIo do
 
   `open/3` answers `{:error, reason}` with `:unsupported` (this platform or
   direction), `:unknown_processor`, `:busy` (8 streams open),
-  `:unavailable` (the platform refused the stream; `status/0`'s
-  `last_error` isn't kept for a failed open, the log line has the detail),
+  `:unavailable` (the platform refused the stream; the spike doesn't
+  return the platform's detail for a failed open yet),
   `:session` (iOS couldn't activate the audio session), or
   `{:invalid_option, key}`.
 

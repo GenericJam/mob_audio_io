@@ -196,6 +196,27 @@ Mac's audio and say nothing about a phone.
   answers `MOB_MIDI_ERR_UNSUPPORTED` on iOS today. Independent of this
   plugin.
 
+## Review
+
+Reviewer subagent (Codex rate-limited until 2026-11-21 01:09): **SHIP** as
+a spike, no blockers. Fixed in this repo: AAudio `setUsage`/`setContentType`
+are optional (API 28; API 26/27 would otherwise refuse every stream),
+`set_logger/1` runs on a dirty scheduler (it takes the plugin's lock),
+`MAI_EVENT_ROUTE_CHANGED` reaches the processor only while the stream is
+stopped (the header promises it never runs beside render), the monitor
+resource type is taken over on a NIF upgrade, and the logger's message env is
+cleared after each send. These need a device run again (the numbers above
+predate them).
+
+Left for the full plugin:
+- an iOS interruption *began* for an app that was suspended has no *ended*
+  (`AVAudioSessionInterruptionReasonAppWasSuspended`): rebuild the unit
+  right away instead of waiting;
+- return the platform's detail for a failed open (`{:error, {reason, detail}}`);
+- park the event thread on a condition variable while no stream is open
+  (it wakes every 5 ms for the app's life now);
+- drain the `mai_post` ring before a closed stream's slot is freed.
+
 ## How to reproduce
 
 See `AGENTS.md` (Testing). In short: `cd example`, zig 0.17.0 on `PATH`,

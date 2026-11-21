@@ -61,7 +61,7 @@ extern "C" {
 #define MAI_EVENT_STARTED 1       /* opened (again): t->rate is the stream's rate */
 #define MAI_EVENT_STOPPED 2       /* closed, or lost and not yet reopened */
 #define MAI_EVENT_INTERRUPTED 3   /* iOS: another app or a call took the session */
-#define MAI_EVENT_ROUTE_CHANGED 4 /* a new output route (headphones, Bluetooth, ...) */
+#define MAI_EVENT_ROUTE_CHANGED 4 /* a new rate or a media reset: the stream is stopped and reopens (STARTED follows) */
 
 typedef struct mai_time {
     /* The stream clock: frames rendered on this stream before this block.
