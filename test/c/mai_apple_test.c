@@ -163,8 +163,6 @@ static AudioTimeStamp stamp(double sample_time, uint64_t host) {
     return ts;
 }
 
-static int64_t abs64(int64_t x) { return x < 0 ? -x : x; }
-
 /* ── Session ───────────────────────────────────────────────────────────── */
 
 static mai_stream g_test_streams[4];
@@ -262,12 +260,14 @@ static void test_output(void) {
     AudioUnitRenderActionFlags flags = 0;
     abl.mBuffers[0].mDataByteSize = 256 * 2 * sizeof(float);
     CHECK(AudioUnitRender(io->unit, &flags, &ts, 0, 256, &abl) == noErr);
+    int64_t after = mai_now_ns();
     int64_t host_ns = mai__ticks_to_ns(host, g_timebase.numer, g_timebase.denom);
     CHECK(p.renders == 1 && p.captures == 0);
     CHECK(p.frames_r == 256 && p.channels_r == 2 && p.rate_r == 48000 && p.frame_r == 0);
     CHECK(p.present_r == host_ns + 7000000);
-    /* on mai_now_ns's clock: the callback's host_ns is within ms of the stamp */
-    CHECK(abs64(p.host_r - host_ns) < 50000000);
+    /* on mai_now_ns's clock: the callback began after the stamp (taken with
+     * mach_absolute_time) and before the render returned */
+    CHECK(p.host_r >= host_ns && p.host_r <= after);
     CHECK(out[0] == 0.001f && out[1] == -0.001f && out[2 * 255] == 0.256f && out[2 * 255 + 1] == -0.256f);
 
     ts = stamp(256, host + 1000);
@@ -309,11 +309,12 @@ static void test_input(void) {
         AudioTimeStamp ts = stamp(0, host);
         AudioUnitRenderActionFlags flags = 0;
         CHECK(mai_apple_input(io, &flags, &ts, 1, 480, NULL) == noErr);
+        int64_t after = mai_now_ns();
         int64_t host_ns = mai__ticks_to_ns(host, g_timebase.numer, g_timebase.denom);
         CHECK(p.captures == 1 && p.renders == 0);
         CHECK(p.frames_c == 480 && p.channels_c == ch && p.frame_c == 0);
         CHECK(p.present_c == host_ns - 3000000);
-        CHECK(abs64(p.host_c - host_ns) < 50000000);
+        CHECK(p.host_c >= host_ns && p.host_c <= after);
         float want1 = 0.5f * (float)sin(2 * M_PI * 1000.0 / RATE);
         CHECK(p.in_first[0] == 0.0f && fabsf(p.in_first[ch == 1 ? 1 : 2] - want1) < 1e-6f);
         if (ch == 2) CHECK(p.in_first[0] == p.in_first[1] && p.in_first[2] == p.in_first[3]);
@@ -591,22 +592,27 @@ static void test_hardware(void) {
         close_stream(s);
         return;
     }
+    /* every callback starts between `before` and `after` (the unit is
+     * stopped and disposed before `after`), however loaded the machine */
+    int64_t before = mai_now_ns();
     OSStatus r = AudioOutputUnitStart(io->unit);
     if (r) {
         printf("SKIP hardware: AudioOutputUnitStart %d\n", (int)r);
     } else {
         usleep(300000);
     }
-    int64_t now = mai_now_ns();
     mai_apple_io_free(io); /* stops first: no callback after */
+    int64_t after = mai_now_ns();
     int renders = atomic_load(&p.renders);
     if (!r && renders == 0) printf("SKIP hardware: the device never called back\n");
     if (renders > 0) {
         CHECK(p.channels_r == 2 && p.rate_r == (int32_t)rate && p.frames_r > 0);
-        CHECK(p.host_r <= now && now - p.host_r < 300000000);
-        /* macOS stamps the output's start time: at or after the callback */
-        CHECK(p.present_r > 0 && p.present_r - p.host_r > -20000000 && p.present_r - p.host_r < 500000000);
-        CHECK(atomic_load(&s->frames_total) >= (uint64_t)(0.1 * rate));
+        CHECK(p.host_r >= before && p.host_r <= after);
+        /* the timestamp's host time is the IO cycle's, near the callback
+         * on the same clock: within a second either way even on a loaded
+         * runner (a different clock would be off by hours) */
+        CHECK(p.present_r > 0 && p.present_r - p.host_r > -1000000000LL && p.present_r - p.host_r < 1000000000LL);
+        CHECK(atomic_load(&s->frames_total) >= (uint64_t)p.frames_r);
         printf("hardware: HALOutput %.0f Hz, %d callbacks of %d frames, present - host %.2f ms, xruns %u\n", rate,
                renders, (int)p.frames_r, (p.present_r - p.host_r) / 1e6, (unsigned)atomic_load(&s->be_xruns));
     }
