@@ -12,7 +12,7 @@ as messages.
 
 ```elixir
 # mix.exs
-{:mob_audio_io, github: "GenericJam/mob_audio_io"}  # "~> 0.1" once 0.1.0 is on Hex
+{:mob_audio_io, "~> 0.1"}
 
 # mob.exs
 config :mob, :plugins, [:mob_audio_io]
