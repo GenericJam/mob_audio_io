@@ -2,9 +2,11 @@ name: tests
 
 # The plugin's host-side Elixir surface (the gate mob core runs: compile,
 # format, credo, tests with the Fake, the manifest check) plus the native
-# code: the C core's host test runs inside `mix test`; the two jobs below
+# code: the C core's host test runs inside `mix test`; the next two jobs
 # compile each platform's NIF with that platform's compiler and check that
-# every function priv/include/mob_audio_io.h declares is defined in it.
+# every function priv/include/mob_audio_io.h declares is defined in it; the
+# last runs the iOS backend's plain C (priv/native/ios/mai_apple.c) against
+# macOS's CoreAudio.
 
 on:
   push:
@@ -110,3 +112,21 @@ jobs:
               -I"$ERTS" -c priv/native/ios/mob_audio_io_nif.m -o "$sdk.o"
             scripts/check_abi_symbols.sh "$sdk.o" "$(xcrun -f nm)"
           done
+
+  macos-coreaudio:
+    name: iOS core on macOS CoreAudio (callbacks through real AudioUnits, ExtAudioFile decode)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # macOS has no MP3 encoder of its own; without one the test skips MP3.
+      - name: MP3 encoder
+        run: brew install lame || echo "no lame, the MP3 decode is skipped"
+
+      - name: priv/native/ios/mai_apple.c under ASan + UBSan
+        run: |
+          clang -std=c11 -Wall -Wextra -Werror -Wno-unused-function -O1 -g \
+            -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+            test/c/mai_apple_test.c -o mai_apple_test \
+            -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
+          ./mai_apple_test "$RUNNER_TEMP/mai_apple_test"

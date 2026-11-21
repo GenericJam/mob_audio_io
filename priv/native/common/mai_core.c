@@ -113,6 +113,8 @@ typedef struct mai_stream {
     int32_t xruns_seen; /* the last xrun count the event thread reported */
     int64_t next_reopen_ns;
     int reopen_failures;
+    int64_t started_ns; /* mai_now_ns() at the platform stream's last start */
+    int quick_losses;   /* device losses in a row, each < 1 s after its start */
     char last_error[MAI_ERRMAX];
     /* The audio thread's own (written only by the callback while running). */
     int64_t frame;     /* the stream clock */
