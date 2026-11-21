@@ -28,14 +28,15 @@ defmodule MobAudioIo.Log do
 
   @impl true
   def handle_info({:mob_audio_io, kind, stream, info}, state) do
-    Logger.log(level(kind), "[mob_audio_io] stream #{stream} #{kind} #{inspect(info)}")
+    Logger.log(level(kind, info), "[mob_audio_io] stream #{stream} #{kind} #{inspect(info)}")
     {:noreply, state}
   end
 
   def handle_info(_other, state), do: {:noreply, state}
 
   @doc false
-  @spec level(atom()) :: Logger.level()
-  def level(kind) when kind in [:error, :device_lost, :xrun, :interrupted], do: :warning
-  def level(_kind), do: :info
+  @spec level(atom(), term()) :: Logger.level()
+  def level(kind, _info) when kind in [:error, :device_lost, :xrun, :interrupted], do: :warning
+  def level(:stopped, %{posts_dropped: n}) when n > 0, do: :warning
+  def level(_kind, _info), do: :info
 end

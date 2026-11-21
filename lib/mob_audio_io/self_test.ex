@@ -3,56 +3,75 @@ defmodule MobAudioIo.SelfTest do
   The plugin's on-device proof (`Mob.Plugin.SelfTest`), run by
   `mix mob.selftest` and mob_ci.
 
-  Opens a real output stream on the built-in `"mai_silence"` processor
-  (nothing audible) through the NIF, waits 100 ms, reads the stream's
-  callback count from `:mob_audio_io_nif.stream_status/1`, and closes it.
-  The platform's audio thread calling the plugin is the answer:
+  1. **Output**: opens a real output stream on the built-in `"mai_silence"`
+     processor (nothing audible) through the NIF, waits 150 ms, and reads
+     the stream's callback count from `:mob_audio_io_nif.stream_status/1`.
+     The platform's audio thread calling the plugin is the answer.
+  2. **Input**, if the microphone is permitted: the same with an input
+     stream. Without the permission (`{:error, :permission}`) this part is
+     left out and the result rests on the output; the runner grants the
+     manifest's permissions on emulators and simulators, so CI covers it.
 
-    * the count rose: `:pass`.
-    * it didn't: a failure (the stream opened but no callback ran).
-    * `open` answered `{:error, reason}` (no AAudio, the session refused):
-      a failure naming the reason.
-    * the NIF isn't linked (`{:error, :unsupported}`): a failure.
+  Outcomes: `:pass` when every stream that opened had callbacks; a failure
+  naming the direction when a stream opened but no callback ran, when an
+  open answered another error, or when the NIF isn't linked
+  (`{:error, :unsupported}`).
 
-  It opens with `session: :mix`, so music another app plays isn't paused.
-  The stream is closed before `run/1` returns and its messages are flushed.
+  Streams open with `session: :mix`, so music another app plays isn't
+  paused. Each is closed before `run/1` returns and its messages are
+  flushed.
   """
   @behaviour Mob.Plugin.SelfTest
 
-  @window_ms 100
+  @window_ms 150
 
   @impl true
   def run(_ctx) do
-    opts = %{processor: "mai_silence", rate: 0, frames: 0, sharing: :shared, session: :mix}
+    with :pass <- check(:output),
+         result when result in [:pass, :not_permitted] <- check(:input) do
+      :pass
+    end
+  end
 
-    case MobAudioIo.Native.open(self(), :output, opts) do
+  defp check(direction) do
+    {:ok, opts} =
+      MobAudioIo.normalize_options(direction, processor: "mai_silence", session: :mix)
+
+    case MobAudioIo.Native.open(self(), direction, opts) do
       {:ok, stream} ->
         before = callbacks(stream)
         Process.sleep(@window_ms)
         later = callbacks(stream)
         MobAudioIo.Native.close(stream)
         flush(stream)
-        classify(before, later)
+        classify(direction, before, later)
+
+      {:error, :permission} when direction == :input ->
+        :not_permitted
 
       {:error, :unsupported} ->
         {:fail, "mob_audio_io_nif is not linked into this build (open answered :unsupported)"}
 
       {:error, reason} ->
-        {:fail, "open(:output, \"mai_silence\") failed: #{inspect(reason)}"}
+        {:fail, "open(#{inspect(direction)}, \"mai_silence\") failed: #{inspect(reason)}"}
     end
   end
 
   @doc false
   # The callback counts at the window's start and end.
-  @spec classify(term(), term()) :: Mob.Plugin.SelfTest.result()
-  def classify(before, later) when is_integer(before) and is_integer(later) and later > before,
-    do: :pass
+  @spec classify(MobAudioIo.direction(), term(), term()) :: Mob.Plugin.SelfTest.result()
+  def classify(_direction, before, later)
+      when is_integer(before) and is_integer(later) and later > before,
+      do: :pass
 
-  def classify(before, later) when is_integer(before) and is_integer(later),
-    do: {:fail, "no audio callback in #{@window_ms} ms (callbacks #{before} -> #{later})"}
+  def classify(direction, before, later) when is_integer(before) and is_integer(later),
+    do:
+      {:fail,
+       "#{direction}: no audio callback in #{@window_ms} ms (callbacks #{before} -> #{later})"}
 
-  def classify(before, later),
-    do: {:fail, "stream_status/1 gave no callback count: #{inspect({before, later})}"}
+  def classify(direction, before, later),
+    do:
+      {:fail, "#{direction}: stream_status/1 gave no callback count: #{inspect({before, later})}"}
 
   defp callbacks(stream) do
     case MobAudioIo.Native.stream_status(stream) do

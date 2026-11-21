@@ -55,11 +55,14 @@ static struct aaudio_api {
     const char *(*convertResultToText)(aaudio_result_t);
 } A;
 
+static int g_api; /* the device's API level */
+
 static const char *be_platform(void) { return "android"; }
 
 static const char *be_load(void) {
     struct aaudio_api a;
     if (A.h) return NULL;
+    g_api = android_get_device_api_level();
     if (!(a.h = dlopen("libaaudio.so", RTLD_NOW))) return "unavailable";
 #define S(f, n) \
     if (!(*(void **)&a.f = dlsym(a.h, n))) goto fail
@@ -106,9 +109,18 @@ static void set_aaudio_error(mai_stream *s, const char *what, aaudio_result_t r)
     mai__set_error(s, buf);
 }
 
+/* When the block about to be rendered is heard: from the anchor be_poll
+ * publishes (AAudio timestamps, API 31+), else now plus the buffer. */
+static int64_t out_present(mai_stream *s, int64_t t0) {
+    if (s->present == MAI_PRESENT_TIMESTAMP) return mai__present_from_anchor(s, s->frame);
+    return t0 + atomic_load_explicit(&s->out_latency_ns, memory_order_relaxed);
+}
+
 static aaudio_data_callback_result_t on_data(AAudioStream *st, void *user, void *audio, int32_t n) {
     (void)st;
-    mai__render((mai_stream *)user, (float *)audio, n);
+    mai_stream *s = user;
+    int64_t t0 = mai_now_ns();
+    mai__process(s, NULL, (float *)audio, n, t0, 0, out_present(s, t0));
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -137,7 +149,16 @@ static aaudio_result_t try_open(mai_stream *s, aaudio_sharing_mode_t mode, AAudi
     return r;
 }
 
+/* The buffer's length in ns: the latency estimate below API 31. */
+static void set_buffer_latency(mai_stream *s) {
+    if (s->rate > 0) atomic_store(&s->out_latency_ns, (int64_t)s->buffer * 1000000000LL / s->rate);
+}
+
 static const char *be_open(mai_stream *s) {
+    if (s->dir != MAI_DIR_OUT) {
+        mai__set_error(s, "input streams are not in this build");
+        return "unsupported";
+    }
     AAudioStream *st = NULL;
     aaudio_result_t r = AAUDIO_ERROR_INTERNAL;
     if (s->sharing == MAI_SHARING_EXCLUSIVE) r = try_open(s, AAUDIO_SHARING_MODE_EXCLUSIVE, &st);
@@ -155,6 +176,9 @@ static const char *be_open(mai_stream *s) {
     int32_t want = s->want_frames > 0 ? s->want_frames : 2 * s->burst; /* double buffering */
     if (want > 0) A.setBufferSizeInFrames(st, want);
     s->buffer = A.getBufferSizeInFrames(st);
+    /* AAudioStream_getTimestamp only from API 31 (see be_latency) */
+    s->present = g_api >= 31 ? MAI_PRESENT_TIMESTAMP : MAI_PRESENT_ESTIMATE;
+    set_buffer_latency(s);
     s->be = st;
     return NULL;
 }
@@ -184,7 +208,17 @@ static void be_tune(mai_stream *s) {
     if (size + s->burst <= s->capacity) {
         A.setBufferSizeInFrames(st, size + s->burst);
         s->buffer = A.getBufferSizeInFrames(st);
+        set_buffer_latency(s);
     }
+}
+
+/* API 31+: the presentation anchor from AAudio's timestamp (the stream's
+ * frame position `pos` is heard at `ns`; the stream started at be_frame0). */
+static void be_poll(mai_stream *s) {
+    AAudioStream *st = s->be;
+    int64_t pos, ns;
+    if (!st || s->present != MAI_PRESENT_TIMESTAMP) return;
+    if (A.getTimestamp(st, CLOCK_MONOTONIC, &pos, &ns) == AAUDIO_OK && ns > 0) mai__set_anchor(s, s->be_frame0 + pos, ns);
 }
 
 /* Output latency. AAudioStream_getTimestamp aborts the process on Android
@@ -193,17 +227,32 @@ static void be_tune(mai_stream *s) {
  * moto g power 2021 (its crash buffer, 2026-11-20). Below API 31 this is
  * only the frames written but not yet read by the device; from 31 on, the
  * frames written but not yet presented (fm1audio's stats). */
-static double be_latency_ms(mai_stream *s) {
+static void be_latency(mai_stream *s, double *out_ms, double *in_ms) {
     AAudioStream *st = s->be;
     int64_t pos, ns;
-    if (!st || s->rate <= 0) return -1;
+    *in_ms = -1;
+    *out_ms = -1;
+    if (!st || s->rate <= 0) return;
     int64_t written = A.getFramesWritten(st);
-    if (android_get_device_api_level() < 31) return (double)(written - A.getFramesRead(st)) * 1000.0 / s->rate;
-    if (A.getTimestamp(st, CLOCK_MONOTONIC, &pos, &ns) != AAUDIO_OK) return -1;
-    double since = (mai__now_ns() - ns) / 1e9;
-    return ((double)(written - pos) / s->rate - since) * 1000.0;
+    if (g_api < 31) {
+        *out_ms = (double)(written - A.getFramesRead(st)) * 1000.0 / s->rate;
+        return;
+    }
+    if (A.getTimestamp(st, CLOCK_MONOTONIC, &pos, &ns) != AAUDIO_OK) return;
+    double since = (mai_now_ns() - ns) / 1e9;
+    *out_ms = ((double)(written - pos) / s->rate - since) * 1000.0;
 }
 
 static void be_idle(void) {}
 
 static ERL_NIF_TERM be_session_term(ErlNifEnv *env) { return atom(env, "nil"); }
+
+static ERL_NIF_TERM be_devices(ErlNifEnv *env, int dir) {
+    (void)dir;
+    return error_atom(env, "unsupported");
+}
+
+static const char *be_decode(const char *path, mai_pcm *pcm, int32_t *rate, char *detail, size_t detail_n) {
+    (void)path; (void)pcm; (void)rate; (void)detail; (void)detail_n;
+    return "unsupported";
+}

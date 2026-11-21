@@ -1,14 +1,30 @@
 # Changelog
 
-## Unreleased (0.1.0-dev, spike for MOB-531)
+## Unreleased (0.1.0)
 
-- C ABI `priv/include/mob_audio_io.h`: `mai_register`, `mai_unregister`,
-  `mai_post`, `mai_abi_version`; `mai_processor` (render, capture,
-  stream_event) and `mai_time` (stream frame, host ns, rate, channels).
-- Output streams: AAudio (Android, low latency, shared or exclusive, burst
-  tuning after underruns, reopen on disconnect) and RemoteIO +
-  AVAudioSession (iOS, interruptions, route changes, media-services resets).
-- `MobAudioIo.open/3`, `close/1`, `status/0,1`, `reset_stats/1`,
-  `processors/0`; owner messages; `[mob_audio_io]` logging of native events;
-  `MobAudioIo.Fake`; `MobAudioIo.SelfTest`.
-- Built-in processors `"mai_silence"` and `"mai_sine"`.
+- C ABI `priv/include/mob_audio_io.h` (ABI 1): `mai_register`,
+  `mai_unregister`, `mai_post`, `mai_abi_version`, `mai_now_ns`;
+  `mai_processor` (render, capture, `stream_event(ctx, stream, event,
+  time)`) and `mai_time` (stream frame, host ns, presentation ns, rate,
+  channels). iOS times are on mach_absolute_time's clock (the clock of
+  `AudioTimeStamp.mHostTime` and mob_midi), Android's on CLOCK_MONOTONIC.
+- Presentation time per block: iOS from `mHostTime` plus the session's
+  latency; Android 12+ from AAudio timestamps (polled off the audio thread),
+  Android 8-11 estimated from the buffer, never calling
+  `AAudioStream_getTimestamp`, which aborts there.
+- `MobAudioIo.open/3` takes `:module` (the app's NIF module, loaded first),
+  `:channels`, `:input_channels`, `:preset`, `:device`, `:input_device`; a
+  failed open returns the platform's detail (`{:error, {:unavailable,
+  detail}}`).
+- `status/0`: `cb_frames` (the last callback's), `cb_frames_min/max`,
+  `input_latency_ms`, `present`, `input_underflows`, `in_peak_db`,
+  `in_rms_db`.
+- Posts still queued at close reach the owner before `:stopped`, or are
+  counted in `:stopped`'s `posts_dropped` when the owner has exited.
+- The event thread sleeps while no stream is open; failed reopens back off
+  from 0.5 s to 8 s.
+- iOS: an interruption that began while the app was suspended, or whose end
+  never came, is recovered when the app returns to the foreground.
+- `MobAudioIo.devices/1`, `MobAudioIo.decode/2`; the Fake decodes WAV.
+- `MobAudioIo.SelfTest` checks output and, when the microphone is
+  permitted, input.
