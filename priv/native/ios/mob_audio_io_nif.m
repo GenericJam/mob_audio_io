@@ -192,17 +192,34 @@ static const char *apply_session(mai_stream *s, bool activate) {
     }
 }
 
+/* follow_open_streams' pacing: one attempt per event-thread tick however
+ * many streams poll, and a configuration that failed to apply isn't
+ * tried again for FOLLOW_RETRY_NS (g_lock). */
+#define FOLLOW_GAP_NS 50000000LL     /* under POLL_NS: once per 100 ms tick */
+#define FOLLOW_RETRY_NS 2000000000LL
+static int64_t g_follow_at;
+static bool g_follow_failed;
+static mai_apple_session g_follow_failed_want;
+static int64_t g_follow_failed_until;
+
 /* (g_lock held) An open stream may have closed since the session was set
  * (mai_nif.c has no close hook): bring the session back in line with the
  * streams still open. */
 static void follow_open_streams(void) {
     if (!g_session_applied) return;
+    int64_t now = mai_now_ns();
+    if (now < g_follow_at) return;
+    g_follow_at = now + FOLLOW_GAP_NS;
     double hw;
     @autoreleasepool {
         hw = [AVAudioSession sharedInstance].sampleRate;
     }
     mai_apple_session want = mai_apple_session_for(g_streams, MAI_MAX_STREAMS, hw);
-    if (want.streams && !mai_apple_session_eq(&want, &g_applied)) apply_session(NULL, false);
+    if (!want.streams || mai_apple_session_eq(&want, &g_applied)) return;
+    if (g_follow_failed && mai_apple_session_eq(&want, &g_follow_failed_want) && now < g_follow_failed_until) return;
+    g_follow_failed = apply_session(NULL, false) != NULL;
+    g_follow_failed_want = want;
+    g_follow_failed_until = now + FOLLOW_RETRY_NS;
 }
 
 /* The microphone, without prompting: the app asks (Mob.Permissions). */
@@ -300,6 +317,12 @@ static const char *be_open(mai_stream *s) {
     refresh_latencies(s);
     atomic_store(&s->be_xruns, 0);
     atomic_store(&g_unit_rate[slot_of(s)], s->rate);
+    /* a rate change between the read above and the store slips past the
+     * route observer: catch it here */
+    @autoreleasepool {
+        double now_rate = [AVAudioSession sharedInstance].sampleRate;
+        if (now_rate > 0 && fabs(now_rate - s->rate) > 0.5) atomic_fetch_or(&s->pending, MAI_PF_ROUTE | MAI_PF_RESET);
+    }
     /* the session may have moved to another rate under the other streams'
      * units: rebuild those at this one */
     for (int i = 0; i < MAI_MAX_STREAMS; i++) {
@@ -414,12 +437,33 @@ static const char *port_kind(AVAudioSessionPort t) {
 }
 
 /* :input: the session's available inputs (their UIDs are what :device
- * takes); :output: the current route's outputs (iOS picks them). */
+ * takes); :output: the current route's outputs (iOS picks them).
+ * availableInputs is empty unless the category records (QA1799): with no
+ * session active, set PlayAndRecord (not activated) first, and mark the
+ * session stale so the next open applies its own. While streams hold an
+ * active session of another category, switching it would reroute them:
+ * the list is what iOS gives then (often empty; open an input first). */
 static ERL_NIF_TERM be_devices(ErlNifEnv *env, int dir) {
     @autoreleasepool {
         AVAudioSession *as = [AVAudioSession sharedInstance];
-        NSArray<AVAudioSessionPortDescription *> *ports =
-            dir == MAI_DIR_IN ? as.availableInputs : as.currentRoute.outputs;
+        NSArray<AVAudioSessionPortDescription *> *ports;
+        if (dir == MAI_DIR_IN) {
+            pthread_mutex_lock(&g_lock);
+            if (!g_session_active && ![as.category isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
+                NSError *err = nil;
+                if (![as setCategory:AVAudioSessionCategoryPlayAndRecord
+                                mode:AVAudioSessionModeDefault
+                             options:AVAudioSessionCategoryOptionDefaultToSpeaker |
+                                     AVAudioSessionCategoryOptionAllowBluetoothA2DP
+                               error:&err])
+                    set_ns_error(NULL, "setCategory (devices)", err);
+                g_session_applied = false;
+            }
+            ports = as.availableInputs;
+            pthread_mutex_unlock(&g_lock);
+        } else {
+            ports = as.currentRoute.outputs;
+        }
         ERL_NIF_TERM list = enif_make_list(env, 0);
         for (AVAudioSessionPortDescription *p in ports.reverseObjectEnumerator) {
             ERL_NIF_TERM k[3] = {atom(env, "id"), atom(env, "name"), atom(env, "kind")};
