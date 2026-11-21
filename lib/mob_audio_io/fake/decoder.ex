@@ -5,11 +5,14 @@ defmodule MobAudioIo.Fake.Decoder do
   # files"): :decode_started, :decoded chunks while fewer than `window` are
   # unacknowledged, then one end. It answers {:cancel, from, ref} with
   # {ref, :ok} and sends nothing after but :decode_cancelled; the owner's
-  # exit stops it. `ended` runs last, after the end went out.
+  # exit stops it. `ended` gets the decode and a function sending the end:
+  # the Fake sends it and frees the decode at once, as the NIF does under
+  # its lock.
 
   alias MobAudioIo.Fake.Wav
 
-  @spec run(pos_integer(), String.t(), pid(), map(), (pos_integer() -> any())) :: any()
+  @spec run(pos_integer(), String.t(), pid(), map(), (pos_integer(), (-> any()) -> any())) ::
+          any()
   def run(decode, path, owner, opts, ended) do
     st = %{
       decode: decode,
@@ -30,8 +33,7 @@ defmodule MobAudioIo.Fake.Decoder do
         {:error, reason} -> {{:error, reason}, st}
       end
 
-    finish(result)
-    ended.(decode)
+    ended.(decode, fn -> finish(result) end)
   end
 
   defp read(path) do

@@ -218,7 +218,7 @@ defmodule MobAudioIo.Fake do
 
           pid =
             spawn(fn ->
-              MobAudioIo.Fake.Decoder.run(decode, path, owner, opts, &decode_ended/1)
+              MobAudioIo.Fake.Decoder.run(decode, path, owner, opts, &decode_ended/2)
             end)
 
           {{:ok, decode}, %{s | next: decode + 1, decodes: Map.put(s.decodes, decode, pid)}}
@@ -226,7 +226,15 @@ defmodule MobAudioIo.Fake do
     end)
   end
 
-  defp decode_ended(decode), do: update(&%{&1 | decodes: Map.delete(&1.decodes, decode)})
+  # The end goes out and the decode is freed in one step: once the owner has
+  # it, decode_ack/2 and decode_cancel/1 answer :not_running and the slot is
+  # free, as on a device.
+  defp decode_ended(decode, send_end) do
+    update(fn s ->
+      send_end.()
+      %{s | decodes: Map.delete(s.decodes, decode)}
+    end)
+  end
 
   @impl true
   def decode_ack(decode, n) do

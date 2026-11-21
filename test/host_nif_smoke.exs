@@ -113,7 +113,8 @@ defmodule HostNifSmoke do
   end
 
   # The owner: takes each chunk, reads it (an analysis would), acks it;
-  # never more than the window waiting in the mailbox. Cancels once
+  # never more than the window - 1 other chunks waiting in the mailbox (the
+  # end may follow the last ones without an ack). Cancels once
   # `cancel_at` frames arrived (nil: never).
   defp stream(path, opts, cancel_at \\ nil) do
     :erlang.garbage_collect()
@@ -152,7 +153,8 @@ defmodule HostNifSmoke do
         loop(Map.put(acc, :started, info))
 
       {:mob_audio_io, :decoded, ^d, chunk} ->
-        {:message_queue_len, waiting} = Process.info(self(), :message_queue_len)
+        {:messages, mailbox} = Process.info(self(), :messages)
+        waiting = Enum.count(mailbox, &match?({:mob_audio_io, :decoded, ^d, _}, &1))
         _sum = for <<x::float-32-native <- chunk>>, reduce: 0.0, do: (s -> s + x * x)
 
         acc = %{
