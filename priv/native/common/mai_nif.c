@@ -98,6 +98,7 @@ typedef struct {
 
 #define REOPEN_RETRY_NS 500000000LL
 #define REOPEN_RETRY_MAX_NS 8000000000LL
+#define FLAP_NS 1000000000LL /* a loss this soon after a start is a quick loss */
 #define POLL_NS 100000000LL
 #define EVENT_PERIOD_US 5000
 
@@ -217,6 +218,7 @@ static const char *start_stream_locked(mai_stream *s) {
     }
     s->running = true;
     s->xruns_seen = 0;
+    s->started_ns = mai_now_ns();
     return NULL;
 }
 
@@ -343,7 +345,21 @@ static void handle_pending_locked(ErlNifEnv *env, mai_stream *s, uint32_t pf, in
     if (pf & MAI_PF_DEVICE_LOST) {
         notify(env, true, s, "device_lost", empty_map(env), true);
         if (s->be) stop_and_report_locked(env, s, "device_lost");
-        if (!s->interrupted) try_reopen_locked(env, s, now, "device_lost", true);
+        /* A stream lost within a second of its start, again and again (an
+         * explicit device the system won't route to: Android disconnects
+         * it ~60 ms in), is a flap: wait 0.5 s, 1 s ... 8 s between tries
+         * instead of reopening at once forever. A stream that ran longer
+         * reopens at once. */
+        bool quick = s->started_ns && now - s->started_ns < FLAP_NS;
+        s->quick_losses = quick ? s->quick_losses + 1 : 0;
+        if (!s->interrupted && s->quick_losses > 1) {
+            int k = s->quick_losses - 2 < 4 ? s->quick_losses - 2 : 4;
+            int64_t wait = REOPEN_RETRY_NS << k;
+            s->next_reopen_ns = now + (wait < REOPEN_RETRY_MAX_NS ? wait : REOPEN_RETRY_MAX_NS);
+            mai__set_error(s, "lost within 1 s of each start: the system routes this stream elsewhere");
+        } else if (!s->interrupted) {
+            try_reopen_locked(env, s, now, "device_lost", true);
+        }
     }
     if (pf & (MAI_PF_ROUTE | MAI_PF_RESET)) {
         /* ROUTE alone: a new route at the same rate (the unit follows it).
