@@ -10,31 +10,44 @@ played through the speaker and heard back through the microphone (duplex
 times (duplex `loop_latency`), and decoding a WAV, an MP3 and an M4A shipped
 in `priv/audio`. Worst-case counters are zeroed 1 s after each open.
 
-**Only the moto g power column is a full run of the final build** (main
-8f1905e, PRs #1-#3). The simulator column is a full run with the final iOS
-code. At 10:33 UTC Kevin paused all device audio while the moto e and iPhone
-SE runs of the final build were pending: their columns come from earlier
-builds and shorter runs (named in the "build" row) and the whole columns
-need a re-run of the final build once audio may resume (MOB-546).
+The moto e, iPhone SE and Android 15 emulator columns are full runs of the
+final build (main faf1de8, with `decode_stream/3`) on 2026-11-21, after
+device audio resumed (MOB-546). The moto g power column is the earlier final
+run (main 8f1905e, PRs #1-#3); the simulator column ran the final iOS code.
 
 ## Results
 
-| | moto g power 2021 (Android 11, API 30) | moto e (Android 10, API 29, armv7a) | iPhone SE 3rd gen (iOS 27.2.1) | iOS simulator (iPhone Air, iOS 27.0) |
-|--|--|--|--|--|
-| build | final (main 8f1905e) | PR #3 before review fixes (agent run) | PR #2 at b84e840 | final iOS code (e74cd0e) |
-| self-test (output + input) | pass | n/a | pass (output; input not permitted yet) | pass |
-| output 60 s, `spike_click` | 13,535 callbacks, 0 xruns, cb_frames 240 (16-240), cb_max 740 µs, gap_max 10.6 ms, latency 10.0 ms, present :estimate, 123/123 posts | 5 s `mai_sine`: 1 xrun, buffer 480 → 720 | 3 s: cb_frames 240, 0 xruns, gap_max 5.06 ms, latency 16.5 ms, present :timestamp | 5,254 callbacks, 0 xruns, cb_frames 557-558, cb_max 8 µs, gap_max 11.7 ms, 122 posts |
-| input 60 s | 16,620 callbacks, 0 xruns, cb_frames 192 (64-192), cb_max 243 µs, gap_max 5.7 ms, input latency 4.0 ms; ambient RMS median -74.3 dBFS, peak -57.8 | 10 s: 2,105 callbacks, 0 xruns, RMS -72..-76 dBFS | *pending* (microphone permission) | 5,328 callbacks, 0 xruns, RMS median -60.0 dBFS, peak -38.3 |
-| tone 1 kHz, speaker → mic | 1000.0 Hz median (999.98-1000.02) in 20/20 windows, -9.6 dBFS | *pending* | *pending* | not heard (the Mac's speaker and mic; RMS -59.6) |
-| duplex | 3,550 callbacks, 0 xruns, 0 input underflows, cb_max 321 µs, input latency 12 ms | 10 s: 0 xruns, 0 underflows, cb_max 303 µs | *pending* | 0 xruns, 19 underflows in 15 s (the simulator alternates 557/558-frame blocks) |
-| loopback round trip | median 108.6 ms (8 of 16 bursts heard; spread 5-452 ms: the detector is unreliable against this phone's AGC) | *pending* | *pending* | median 37.5 ms (37.5-38.1, 15 of 16 heard); presentation-time gap 37.3 ms |
-| decode WAV 44.1 kHz stereo | 88,200 frames, 2 ch, -24.1 dBFS | 88,200 frames | 88,200 frames, 24 ms | 88,200 frames, 17 ms |
-| decode MP3 48 kHz mono | 96,000 frames (exact) | 66,150 at 22.05 kHz (agent's file) | 97,920 (ExtAudioFile keeps the encoder padding) | 97,920 |
-| decode M4A 48 kHz stereo | 96,256 frames | | 96,000 (exact) | 96,000 |
-| decode errors | missing: `{:not_found, ...}`; 100 kB cap: `:too_large` | same | same | same |
-| devices | in: 14, 15 builtin_mic; out: 2 speaker, 3 earpiece | in: 13, 14; out: 2 earpiece, 3 speaker | in: "Built-In Microphone" (an inactive PlayAndRecord session lists it); out: Speaker | MicrophoneBuiltIn; Speaker |
-| presets | default 6, generic 1, performance 10, unprocessed 9, voice 7 all open (agent run); `:voice` heard another phone's tone at -36 dBFS (AEC/NS gate the phone's own tone and a quiet room to zeros) | same 5 open | *pending* | `:voice` VoiceChat + VoiceProcessingIO, `:unprocessed` Measurement (agent run) |
-| permission | revoked: input and duplex `{:error, :permission}`, output runs | | prompt shown; `:permission` until allowed | revoked: `:permission`; granted: opens |
+| | moto g power 2021 (Android 11, API 30) | moto e (Android 10, API 29, armv7a) | iPhone SE 3rd gen (iOS 27.2.1) | Android 15 emulator (API 35, arm64) | iOS simulator (iPhone Air, iOS 27.0) |
+|--|--|--|--|--|--|
+| build | main 8f1905e | main faf1de8 | main faf1de8 | main faf1de8 (`run_all(10)`) | final iOS code (e74cd0e) |
+| self-test (output + input) | pass | pass | pass | pass | pass |
+| output 60 s, `spike_click` | 13,535 callbacks, 0 xruns, cb_frames 240 (16-240), cb_max 740 µs, gap_max 10.6 ms, latency 10.0 ms, present :estimate, 123/123 posts | 13,313 callbacks, 0 xruns, cb_frames 240 (16-240), cb_max 512 µs, gap_max 10.4 ms, latency 10.0 ms, present :estimate, 123/123 posts | 12,001 callbacks, 0 xruns, cb_frames 240 (240-240), cb_max 58 µs, gap_max 5.10 ms, latency 16.5 ms, present :timestamp, 122/122 posts | 10 s: 0 xruns, latency 115.5 ms, **present :timestamp** | 5,254 callbacks, 0 xruns, cb_frames 557-558, cb_max 8 µs, gap_max 11.7 ms, 122 posts |
+| input 60 s | 16,620 callbacks, 0 xruns, cb_frames 192 (64-192), cb_max 243 µs, gap_max 5.7 ms, input latency 4.0 ms; ambient RMS median -74.3 dBFS, peak -57.8 | 13,505 callbacks, 0 xruns, cb_max 214 µs, gap_max 6.7 ms, input latency 5.0 ms; ambient RMS median -72.4 dBFS, peak -34.6 | 12,532 callbacks, 0 xruns, cb_frames 240, cb_max 1.25 ms, gap_max 5.33 ms, input latency 7.4 ms; ambient RMS median -60.3 dBFS, peak -26.2 | 10 s: 0 xruns, input latency 11.2 ms, **present :timestamp** | 5,328 callbacks, 0 xruns, RMS median -60.0 dBFS, peak -38.3 |
+| tone 1 kHz, speaker → own mic | 1000.0 Hz median (999.98-1000.02) in 20/20 windows, -9.6 dBFS | not heard: see below | 1000.0 Hz in 20/20 windows (1000.0-1000.0), RMS median -21.4 dBFS | emulator mic is a synthetic 220 Hz tone, not the Mac's | not heard (the Mac's speaker and mic; RMS -59.6) |
+| tone from another source | | the iPhone's 1 kHz: 1000.1-1000.3 Hz, clarity ≥ 0.99, `:default` and `:unprocessed` | the Mac's 1 kHz: 1000.1-1000.2 Hz, clarity ≥ 0.99, with `:default`, `:unprocessed` and `:voice` (VoiceProcessingIO, input only) | | |
+| duplex | 3,550 callbacks, 0 xruns, 0 input underflows, cb_max 321 µs, input latency 12 ms | 10 s: 0 xruns, 0 underflows, cb_max 381 µs | 10 s: 0 xruns, 0 underflows, cb_max 56 µs | 0 xruns, present :timestamp | 0 xruns, 19 underflows in 15 s (the simulator alternates 557/558-frame blocks) |
+| loopback round trip | median 108.6 ms (8 of 16 bursts heard; spread 5-452 ms: the detector is unreliable against this phone's AGC) | 0 of 16 heard (see below) | **median 28.2 ms (27.1-29.0), 16 of 16 heard**; presentation-time gap 14.4 ms | not meaningful (synthetic mic) | median 37.5 ms (37.5-38.1, 15 of 16 heard); presentation-time gap 37.3 ms |
+| decode WAV 44.1 kHz stereo | 88,200 frames, 2 ch, -24.1 dBFS | 88,200 frames, -24.1 dBFS | 88,200 frames, 17 ms | 88,200 frames | 88,200 frames, 17 ms |
+| decode MP3 48 kHz mono | 96,000 frames (exact) | 96,000 (exact) | 97,920 (ExtAudioFile keeps the encoder padding) | 96,000 (exact) | 97,920 |
+| decode M4A 48 kHz stereo | 96,256 frames | 96,256 | 96,000 (exact) | 96,256 | 96,000 |
+| `decode_stream/3` (1024-frame chunks, window 2) | | same PCM as `decode/2` for all three; cancel after the first chunk: `:decode_cancelled` in 24 ms, nothing after it; `processor:`, `max_ms: 100` (`:too_long`), missing file all end correctly | same PCM for all three; cancel 0.24 ms, nothing after it; the other ends as on the moto e | same PCM for all three; cancel 3.4 ms; the other ends correct | |
+| decode errors | missing: `{:not_found, ...}`; 100 kB cap: `:too_large` | same | same | same | same |
+| devices | in: 14, 15 builtin_mic; out: 2 speaker, 3 earpiece | in: 13, 14 builtin_mic; out: 2 earpiece, 3 speaker | in: "iPhone Microphone"; out: Speaker | | MicrophoneBuiltIn; Speaker |
+| presets | default 6, generic 1, performance 10, unprocessed 9, voice 7 all open (agent run); `:voice` heard another phone's tone at -36 dBFS (AEC/NS gate the phone's own tone and a quiet room to zeros) | all 5 open with 0 xruns (granted 6, 1, 10, 9, 7) | `:default`, `:unprocessed` (Measurement), `:voice` (VoiceChat + VoiceProcessingIO) open with 0 xruns | | `:voice` VoiceChat + VoiceProcessingIO, `:unprocessed` Measurement (agent run) |
+| permission | revoked: input and duplex `{:error, :permission}`, output runs | granted (`pm grant`) | allowed; input opens | granted (`pm grant`) | revoked: `:permission`; granted: opens |
+
+The moto e's own speaker could not be heard. The plugin's signal reached the
+speaker: `dumpsys media.audio_flinger` showed the HAL output on
+`AUDIO_DEVICE_OUT_SPEAKER` at -15.1 dBFS for the whole tone (the tone's own
+RMS, 0.25 amplitude), media volume 15/15, master mute off. Yet neither the
+moto e's microphone nor the iPhone SE beside it heard it, while the moto e's
+microphone heard the iPhone's tone cleanly. The fault is past the HAL (the
+phone's speaker or how it lay), not in the plugin; the moto g power 2021
+heard its own tone 20/20 through the same Android path.
+
+The first moto e run overlapped the iPhone's run: its input and tone numbers
+from that run heard the iPhone, so the moto e acoustic rows above are from
+runs with the other phone silent.
 
 Other findings:
 
@@ -47,8 +60,9 @@ Other findings:
   core backs such quick losses off (0.5 s → 8 s) instead of reopening ~7
   times a second.
 * Both motos are below API 31, so their presentation times are estimates
-  (`present: :estimate`); the AAudio timestamp path (API 31+) is compiled and
-  guarded but hasn't run on hardware (MOB-546).
+  (`present: :estimate`). The AAudio timestamp path (API 31+) ran on the
+  Android 15 emulator: output, input and duplex all `present: :timestamp`,
+  no abort. Not yet on an Android 12+ phone.
 * Route change: no headphones were attached. The route and rate-change paths
   are covered by the macOS CoreAudio CI job and the simulator's session-union
   run (`:mix` output, then an input stream: Playback → PlayAndRecord with the
@@ -61,9 +75,8 @@ Other findings:
 
 ## Streaming decode (`decode_stream/3`)
 
-Added after the device runs above, while device audio was paused: it has
-run on the host only. `decode/2` now runs on it, so the decode rows above
-predate it too.
+Measured on the host first, then on the phones (the `decode_stream/3` row
+above). `decode/2` runs on it.
 
 Measured on the Mac (M4 Pro, macOS 27.0.1), 5-minute 44.1 kHz stereo
 files (a 1 kHz tone), chunks of 4096 frames, a window of 4:
@@ -82,12 +95,11 @@ In the core's host test (`test/c/mai_core_test.c`, also under TSan) a
 cancel ends a decode waiting for an ack in ~0.02 ms, and one busy decoding
 at its next push.
 
-Pending on devices (MOB-546), with `AudioIoSpike.Probe.decode_stream_all/0`
-(part of `run_all/0`): the Android `AMediaCodec` loop on its own thread
-(cancel per codec buffer, `durationUs` as the stated length, HE-AAC's
-doubled rate), and the iOS build of the same ExtAudioFile code the host
-runs. Decoding plays nothing, but the phones stay untouched while device
-audio is paused.
+On the phones (`AudioIoSpike.Probe.decode_stream_all/0`, part of
+`run_all/0`), the Android `AMediaCodec` loop and the iOS build of the same
+ExtAudioFile code returned the same PCM as `decode/2`, and cancel ended the
+decode with nothing after `:decode_cancelled` (table above). Long files were
+measured on the host only; Android's HE-AAC doubled rate is not measured yet.
 
 # The spike (MOB-531, phase 1)
 
