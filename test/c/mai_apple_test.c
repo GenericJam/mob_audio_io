@@ -13,15 +13,23 @@
  *             RemoteIO's bus 1), the meter, a failing pull.
  *   duplex    one render: capture of the pulled input, then render, the
  *             same clock; a failing pull is an input underflow.
- *   decode    ExtAudioFile on a WAV written here, an AAC .m4a made with
- *             afconvert, an MP3 when the machine has an MP3 encoder (ffmpeg
- *             with libmp3lame, or lame; macOS has none of its own), and the
- *             errors.
+ *   decode    ExtAudioFile through the streaming decode on a WAV written
+ *             here, an AAC .m4a made with afconvert, an MP3 when the
+ *             machine has an MP3 encoder (ffmpeg with libmp3lame, or lame;
+ *             macOS has none of its own), max_ms and the errors.
+ *   stream    5-minute WAV, M4A and MP3 files decoded on a worker thread
+ *             to an owner that acks each chunk (as the NIF runs it): the
+ *             chunk buffers in memory never pass the window plus one, the
+ *             process's footprint grows by far less than the file's PCM
+ *             (not asserted under ASan, whose quarantine keeps freed
+ *             chunks), and a cancel a third of the way in ends the decode
+ *             within one ExtAudioFileRead with nothing sent after it.
  *   hardware  the same unit setup (EnableIO, formats, callbacks) on
  *             macOS's HALOutput playing silence on the default output
  *             device for 300 ms; skipped without one (CI runners). Input
  *             from hardware needs the microphone permission (TCC) and is
- *             not tried.
+ *             not tried. MAI_APPLE_TEST_NO_HARDWARE=1 skips it (a Mac
+ *             whose audio must stay untouched).
  *
  * clang -std=c11 -Wall -Wextra -Werror -Wno-unused-function test/c/mai_apple_test.c -o mai_apple_test \
  *   -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
@@ -29,6 +37,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <mach/mach.h>
 #include <unistd.h>
 
 #include "../../priv/native/common/mai_core.c"
@@ -409,54 +418,101 @@ static void test_duplex(void) {
 
 /* ── Decode ────────────────────────────────────────────────────────────── */
 
-static bool grow(mai_pcm *p, size_t bytes) {
-    float *d = realloc(p->data, bytes);
-    if (!d) return false;
-    p->data = d;
-    p->cap = bytes;
-    return true;
-}
-
+/* A whole file through the streaming decode on this thread, collected (a
+ * sink that keeps every chunk, never waiting for an ack). */
 typedef struct {
     const char *err;
     char detail[MAI_ERRMAX];
-    int32_t rate;
-    mai_pcm pcm;
+    int how;
+    int32_t rate, channels;
+    int64_t declared;
+    size_t frames, cap; /* cap: floats */
+    float *data;
 } decoded;
 
-static decoded decode(const char *path, size_t max_bytes, bool mono) {
-    decoded d;
-    memset(&d, 0, sizeof d);
-    d.pcm.max_bytes = max_bytes;
-    d.pcm.mono = mono;
-    d.pcm.grow = grow;
-    d.err = mai_apple_decode(path, &d.pcm, &d.rate, d.detail, sizeof d.detail);
-    return d;
+static float *collect_buffer(mai_decode *d, size_t samples) {
+    (void)d;
+    return malloc(samples * sizeof(float));
+}
+
+static void collect_release(mai_decode *d, float *buf) {
+    (void)d;
+    free(buf);
+}
+
+static bool collect_started(mai_decode *d) {
+    decoded *c = d->user;
+    c->rate = d->rate;
+    c->channels = d->channels;
+    c->declared = d->declared_frames;
+    return true;
+}
+
+static bool collect_chunk(mai_decode *d, float *buf, int32_t frames) {
+    decoded *c = d->user;
+    size_t n = (size_t)frames * (size_t)d->channels, have = c->frames * (size_t)d->channels;
+    if (have + n > c->cap) {
+        size_t cap = c->cap ? c->cap * 2 : 1u << 16;
+        while (cap < have + n) cap *= 2;
+        float *grown = realloc(c->data, cap * sizeof(float));
+        if (!grown) abort();
+        c->data = grown;
+        c->cap = cap;
+    }
+    memcpy(c->data + have, buf, n * sizeof(float));
+    c->frames += (size_t)frames;
+    free(buf);
+    return true;
+}
+
+static void collect_ended(mai_decode *d, int how, const char *reason, const char *detail) {
+    decoded *c = d->user;
+    c->how = how;
+    snprintf(c->detail, sizeof c->detail, "%s", detail);
+    c->err = how == MAI_DEC_DONE ? NULL : reason ? reason : "cancelled"; /* (the reasons are literals) */
+}
+
+static const mai_dec_sink COLLECT = {collect_buffer, collect_release, collect_started, collect_chunk, collect_ended};
+
+static decoded decode(const char *path, bool mono, int64_t max_ms) {
+    decoded c;
+    memset(&c, 0, sizeof c);
+    mai_decode *d = mai__dec_alloc();
+    d->mono = mono;
+    d->chunk_frames = 4096;
+    d->window = INT32_MAX;
+    d->max_ms = max_ms;
+    d->sink = &COLLECT;
+    d->user = &c;
+    char detail[MAI_ERRMAX] = "";
+    const char *err = mai_apple_decode(path, d, detail, sizeof detail);
+    mai__dec_end(d, err, detail);
+    return c;
 }
 
 /* Positive-going zero crossings per second of channel c over the middle half. */
 static double frequency(const decoded *d, int32_t c) {
-    size_t a = d->pcm.frames / 4, b = 3 * d->pcm.frames / 4, n = 0;
-    int32_t ch = d->pcm.channels;
+    size_t a = d->frames / 4, b = 3 * d->frames / 4, n = 0;
+    int32_t ch = d->channels;
     for (size_t i = a + 1; i < b; i++)
-        if (d->pcm.data[(i - 1) * (size_t)ch + (size_t)c] < 0 && d->pcm.data[i * (size_t)ch + (size_t)c] >= 0) n++;
+        if (d->data[(i - 1) * (size_t)ch + (size_t)c] < 0 && d->data[i * (size_t)ch + (size_t)c] >= 0) n++;
     return n * (double)d->rate / (double)(b - a);
 }
 
 static double rms(const decoded *d, int32_t c) {
-    size_t a = d->pcm.frames / 4, b = 3 * d->pcm.frames / 4;
+    size_t a = d->frames / 4, b = 3 * d->frames / 4;
     double sum = 0;
-    int32_t ch = d->pcm.channels;
-    for (size_t i = a; i < b; i++) sum += (double)d->pcm.data[i * (size_t)ch + (size_t)c] * d->pcm.data[i * (size_t)ch + (size_t)c];
+    int32_t ch = d->channels;
+    for (size_t i = a; i < b; i++) sum += (double)d->data[i * (size_t)ch + (size_t)c] * d->data[i * (size_t)ch + (size_t)c];
     return sqrt(sum / (double)(b - a));
 }
 
-/* 1 s of 44.1 kHz stereo 16-bit: 1 kHz at 0.5 left, at 0.25 right. */
+/* `seconds` of 44.1 kHz stereo 16-bit: 1 kHz at 0.5 left, at 0.25 right. */
 #define WAV_RATE 44100
-static void write_wav(const char *path) {
+static void write_wav(const char *path, uint32_t seconds) {
     FILE *f = fopen(path, "wb");
     if (!f) abort();
-    uint32_t frames = WAV_RATE, data = frames * 4;
+    uint32_t frames = WAV_RATE * seconds, data = frames * 4;
     uint32_t u32;
     uint16_t u16;
 #define W32(v) (u32 = (v), fwrite(&u32, 4, 1, f))
@@ -473,13 +529,15 @@ static void write_wav(const char *path) {
     W16(16);
     fwrite("data", 1, 4, f);
     W32(data);
-    for (uint32_t i = 0; i < frames; i++) {
-        double x = sin(2 * M_PI * 1000.0 * i / WAV_RATE);
-        W16((uint16_t)(int16_t)lround(0.5 * x * 32767));
-        W16((uint16_t)(int16_t)lround(0.25 * x * 32767));
-    }
 #undef W32
 #undef W16
+    static int16_t second[WAV_RATE * 2]; /* 1 kHz repeats every second */
+    for (uint32_t i = 0; i < WAV_RATE; i++) {
+        double x = sin(2 * M_PI * 1000.0 * i / WAV_RATE);
+        second[2 * i] = (int16_t)lround(0.5 * x * 32767);
+        second[2 * i + 1] = (int16_t)lround(0.25 * x * 32767);
+    }
+    for (uint32_t s = 0; s < seconds; s++) fwrite(second, sizeof second, 1, f);
     fclose(f);
 }
 
@@ -491,14 +549,25 @@ static void check_tone(const char *what, const decoded *d, size_t min_frames, si
     }
     double fl = frequency(d, 0), fr = frequency(d, 1), rl = rms(d, 0), rr = rms(d, 1);
     printf("decode %s: rate %d, channels %d, frames %zu, left %.1f Hz rms %.4f, right %.1f Hz rms %.4f\n", what,
-           (int)d->rate, (int)d->pcm.channels, d->pcm.frames, fl, rl, fr, rr);
-    CHECK(d->rate == WAV_RATE && d->pcm.channels == 2);
-    CHECK(d->pcm.frames >= min_frames && d->pcm.frames <= max_frames);
+           (int)d->rate, (int)d->channels, d->frames, fl, rl, fr, rr);
+    CHECK(d->rate == WAV_RATE && d->channels == 2);
+    CHECK(d->frames >= min_frames && d->frames <= max_frames);
     CHECK(fabs(fl - 1000) < 5 && fabs(fr - 1000) < 5);
     CHECK(fabs(rl - 0.5 / sqrt(2)) < rms_tol && fabs(rr - 0.25 / sqrt(2)) < rms_tol);
 }
 
 static bool exists(const char *path) { return access(path, R_OK) == 0; }
+
+/* An MP3 of `wav` at `path`, if this machine has an encoder (macOS ships none). */
+static bool make_mp3(const char *wav, const char *path) {
+    char cmd[2048];
+    snprintf(cmd, sizeof cmd,
+             "(command -v ffmpeg >/dev/null && ffmpeg -loglevel error -y -i '%s' -codec:a libmp3lame -b:a 192k '%s') "
+             "|| (command -v lame >/dev/null && lame --quiet -b 192 '%s' '%s')",
+             wav, path, wav, path);
+    unlink(path);
+    return system(cmd) == 0 && exists(path);
+}
 
 static void test_decode(const char *dir) {
     char wav[512], m4a[512], mp3[512], txt[512], cmd[2048];
@@ -506,65 +575,284 @@ static void test_decode(const char *dir) {
     snprintf(m4a, sizeof m4a, "%s/tone.m4a", dir);
     snprintf(mp3, sizeof mp3, "%s/tone.mp3", dir);
     snprintf(txt, sizeof txt, "%s/not_audio.wav", dir);
-    write_wav(wav);
+    write_wav(wav, 1);
 
-    decoded d = decode(wav, 64u << 20, false);
+    decoded d = decode(wav, false, 0);
     check_tone("wav", &d, WAV_RATE, WAV_RATE, 1e-3);
+    CHECK(d.declared == WAV_RATE);
     /* 16-bit PCM decodes exactly: sample 1 of the left */
-    if (!d.err) CHECK(fabsf(d.pcm.data[2] - (float)lround(0.5 * sin(2 * M_PI * 1000.0 / WAV_RATE) * 32767) / 32768.0f) < 1e-6f);
-    float l1 = d.err ? 0 : d.pcm.data[2], r1 = d.err ? 0 : d.pcm.data[3];
-    free(d.pcm.data);
+    if (!d.err) CHECK(fabsf(d.data[2] - (float)lround(0.5 * sin(2 * M_PI * 1000.0 / WAV_RATE) * 32767) / 32768.0f) < 1e-6f);
+    float l1 = d.err ? 0 : d.data[2], r1 = d.err ? 0 : d.data[3];
+    free(d.data);
 
-    d = decode(wav, 64u << 20, true);
-    CHECK(!d.err && d.pcm.channels == 1 && d.pcm.frames == WAV_RATE && fabsf(d.pcm.data[1] - (l1 + r1) / 2) < 1e-6f);
-    free(d.pcm.data);
+    d = decode(wav, true, 0);
+    CHECK(!d.err && d.channels == 1 && d.frames == WAV_RATE && fabsf(d.data[1] - (l1 + r1) / 2) < 1e-6f);
+    free(d.data);
 
     /* AAC: the encoder's priming and padding are trimmed by ExtAudioFile,
      * allow a frame (1024) either way */
     snprintf(cmd, sizeof cmd, "afconvert -f m4af -d aac -b 192000 '%s' '%s'", wav, m4a);
     CHECK(system(cmd) == 0 && exists(m4a));
-    d = decode(m4a, 64u << 20, false);
+    d = decode(m4a, false, 0);
     check_tone("m4a (aac)", &d, WAV_RATE - 1024, WAV_RATE + 2048, 0.02);
-    free(d.pcm.data);
+    free(d.data);
 
-    snprintf(cmd, sizeof cmd,
-             "(command -v ffmpeg >/dev/null && ffmpeg -loglevel error -y -i '%s' -codec:a libmp3lame -b:a 192k '%s') "
-             "|| (command -v lame >/dev/null && lame --quiet -b 192 '%s' '%s')",
-             wav, mp3, wav, mp3);
-    unlink(mp3);
-    if (system(cmd) == 0 && exists(mp3)) {
-        d = decode(mp3, 64u << 20, false);
+    if (make_mp3(wav, mp3)) {
+        d = decode(mp3, false, 0);
         /* MP3 adds a decoder delay plus padding up to a frame (1152) */
         check_tone("mp3", &d, WAV_RATE - 1152, WAV_RATE + 3 * 1152, 0.02);
-        free(d.pcm.data);
+        free(d.data);
     } else {
         printf("SKIP mp3: no MP3 encoder here (ffmpeg with libmp3lame, or lame); macOS ships none\n");
     }
 
-    d = decode("/nonexistent/tone.wav", 1 << 20, false);
-    CHECK(d.err && strcmp(d.err, "not_found") == 0 && d.pcm.data == NULL);
-    d = decode(dir, 1 << 20, false);
+    d = decode("/nonexistent/tone.wav", false, 0);
+    CHECK(d.err && strcmp(d.err, "not_found") == 0 && d.data == NULL);
+    d = decode(dir, false, 0);
     CHECK(d.err && strcmp(d.err, "not_found") == 0);
 
     FILE *f = fopen(txt, "w");
     fputs("this is not audio, just text long enough to be read as a header\n", f);
     fclose(f);
-    d = decode(txt, 1 << 20, false);
+    d = decode(txt, false, 0);
     CHECK(d.err && strcmp(d.err, "unsupported") == 0 && strstr(d.detail, "ExtAudioFileOpenURL") != NULL);
     printf("decode text file: %s (%s)\n", d.err ? d.err : "ok", d.detail);
-    free(d.pcm.data);
+    free(d.data);
 
-    d = decode(wav, 100000, false); /* 44100 * 2 * 4 bytes don't fit */
-    CHECK(d.err && strcmp(d.err, "too_large") == 0);
-    free(d.pcm.data);
-    d = decode(wav, 44100 * 4, true); /* mono fits exactly */
-    CHECK(!d.err && d.pcm.frames == WAV_RATE);
-    free(d.pcm.data);
+    /* max_ms: the file states 1 s, so 999 ms refuses it before any chunk */
+    d = decode(wav, false, 999);
+    CHECK(d.err && strcmp(d.err, "too_long") == 0 && d.frames == 0 && d.rate == WAV_RATE);
+    free(d.data);
+    d = decode(wav, true, 1000);
+    CHECK(!d.err && d.frames == WAV_RATE);
+    free(d.data);
+}
+
+/* ── Streaming a long file: memory, cancel ─────────────────────────────── */
+
+/* An owner on this thread and the decode on a worker thread, as the NIF
+ * runs it: the owner takes the chunks the worker sends, reads them (an
+ * analysis would), frees them and acks. The sink's fields are under
+ * g_dec_lock. */
+typedef struct {
+    pthread_cond_t cv;
+    float *held[64];
+    int32_t held_frames[64];
+    int n_held, chunks, chunks_after_cancel, how;
+    bool ended, cancel_returned;
+    char reason[32];
+    int64_t end_frames;
+    int64_t foot_max; /* the process's footprint, sampled at every chunk */
+} owner;
+
+static _Atomic int live, live_max;
+
+static int64_t footprint(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &n) != KERN_SUCCESS) return 0;
+    return (int64_t)info.phys_footprint;
+}
+
+static float *owner_buffer(mai_decode *d, size_t samples) {
+    (void)d;
+    int n = atomic_fetch_add(&live, 1) + 1;
+    for (int m = atomic_load(&live_max); n > m && !atomic_compare_exchange_weak(&live_max, &m, n);)
+        ;
+    return malloc(samples * sizeof(float));
+}
+
+static void owner_free(float *buf) {
+    free(buf);
+    atomic_fetch_sub(&live, 1);
+}
+
+static void owner_release(mai_decode *d, float *buf) {
+    (void)d;
+    owner_free(buf);
+}
+
+static bool owner_started(mai_decode *d) {
+    (void)d;
+    return true;
+}
+
+static bool owner_chunk(mai_decode *d, float *buf, int32_t frames) {
+    owner *o = d->user;
+    if (o->cancel_returned) o->chunks_after_cancel++;
+    o->chunks++;
+    o->held[o->n_held] = buf;
+    o->held_frames[o->n_held++] = frames;
+    int64_t f = footprint();
+    if (f > o->foot_max) o->foot_max = f;
+    pthread_cond_signal(&o->cv);
+    return true;
+}
+
+static void owner_ended(mai_decode *d, int how, const char *reason, const char *detail) {
+    (void)detail;
+    owner *o = d->user;
+    o->ended = true;
+    o->how = how;
+    o->end_frames = d->frames;
+    snprintf(o->reason, sizeof o->reason, "%s", reason ? reason : "");
+    pthread_cond_signal(&o->cv);
+}
+
+static const mai_dec_sink OWNER = {owner_buffer, owner_release, owner_started, owner_chunk, owner_ended};
+
+typedef struct {
+    mai_decode *d;
+    const char *path;
+    _Atomic int64_t ended_ns;
+} decode_job;
+
+static void *decode_thread(void *arg) {
+    decode_job *j = arg;
+    char detail[MAI_ERRMAX] = "";
+    const char *err = mai_apple_decode(j->path, j->d, detail, sizeof detail);
+    mai__dec_end(j->d, err, detail);
+    atomic_store(&j->ended_ns, mai_now_ns());
+    return NULL;
+}
+
+#define STREAM_WINDOW 4
+#define STREAM_CHUNK 4096
+
+typedef struct {
+    int how;
+    int64_t frames, end_frames, foot_growth, cancel_latency_ns, wall_ns;
+    int chunks_after_cancel, live_max;
+} streamed;
+
+/* Decode `path` with the owner above; cancel once `cancel_at` frames
+ * arrived (0: never). */
+static streamed stream_file(const char *path, bool mono, int64_t cancel_at) {
+    streamed out;
+    memset(&out, 0, sizeof out);
+    owner o;
+    memset(&o, 0, sizeof o);
+    pthread_cond_init(&o.cv, NULL);
+    atomic_store(&live, 0);
+    atomic_store(&live_max, 0);
+    mai_decode *d = mai__dec_alloc();
+    d->mono = mono;
+    d->chunk_frames = STREAM_CHUNK;
+    d->window = STREAM_WINDOW;
+    d->sink = &OWNER;
+    d->user = &o;
+    int32_t id = d->id;
+    decode_job job = {d, path, 0};
+    int64_t base = footprint(), t0 = mai_now_ns(), t_cancel = 0;
+    o.foot_max = base;
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, decode_thread, &job) == 0);
+    double sumsq = 0;
+    pthread_mutex_lock(&g_dec_lock);
+    for (;;) {
+        while (!o.n_held && !o.ended) pthread_cond_wait(&o.cv, &g_dec_lock);
+        if (!o.n_held) break;
+        float *bufs[64];
+        int32_t frames[64];
+        int n = o.n_held;
+        memcpy(bufs, o.held, sizeof(float *) * (size_t)n);
+        memcpy(frames, o.held_frames, sizeof(int32_t) * (size_t)n);
+        o.n_held = 0;
+        pthread_mutex_unlock(&g_dec_lock);
+        for (int i = 0; i < n; i++) {
+            for (int32_t k = 0; k < frames[i] * (mono ? 1 : 2); k++) sumsq += (double)bufs[i][k] * bufs[i][k];
+            out.frames += frames[i];
+            owner_free(bufs[i]);
+        }
+        mai__dec_ack(id, n);
+        if (cancel_at && !t_cancel && out.frames >= cancel_at) {
+            t_cancel = mai_now_ns();
+            CHECK(mai__dec_cancel(id) == MAI_OK);
+            pthread_mutex_lock(&g_dec_lock);
+            o.cancel_returned = true;
+            pthread_mutex_unlock(&g_dec_lock);
+        }
+        pthread_mutex_lock(&g_dec_lock);
+    }
+    pthread_mutex_unlock(&g_dec_lock);
+    pthread_join(t, NULL);
+    out.wall_ns = atomic_load(&job.ended_ns) - t0;
+    out.how = o.how;
+    out.end_frames = o.end_frames;
+    out.foot_growth = o.foot_max - base;
+    out.cancel_latency_ns = t_cancel ? atomic_load(&job.ended_ns) - t_cancel : 0;
+    out.chunks_after_cancel = o.chunks_after_cancel;
+    out.live_max = atomic_load(&live_max);
+    CHECK(atomic_load(&live) == 0);
+    CHECK(sumsq > 0);
+    pthread_cond_destroy(&o.cv);
+    return out;
+}
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define UNDER_ASAN 1 /* its quarantine keeps freed chunks resident: no footprint bound */
+#endif
+#endif
+
+#define LONG_SECONDS 300
+#define LONG_FRAMES ((int64_t)WAV_RATE * LONG_SECONDS)
+#define FOOTPRINT_BOUND (24LL << 20)
+
+/* A 5-minute file streamed whole (all of it arrives; the chunk buffers in
+ * memory never pass the window plus one; the process's footprint grows by
+ * far less than the file's PCM), then cancelled a third of the way in
+ * (it ends within one ExtAudioFileRead; nothing arrives after the cancel). */
+static void stream_long(const char *what, const char *path, bool mono, int64_t slack) {
+    int32_t ch = mono ? 1 : 2;
+    streamed s = stream_file(path, mono, 0);
+    double pcm_mb = LONG_FRAMES * ch * 4 / 1048576.0;
+    printf("stream %s: %lld frames in %.0f ms, footprint +%.1f MB (the whole PCM: %.1f MB), at most %d chunk "
+           "buffers of %d KB live\n",
+           what, (long long)s.frames, s.wall_ns / 1e6, s.foot_growth / 1048576.0, pcm_mb, s.live_max,
+           STREAM_CHUNK * ch * 4 / 1024);
+    CHECK(s.how == MAI_DEC_DONE && s.frames == s.end_frames);
+    CHECK(s.frames >= LONG_FRAMES - slack && s.frames <= LONG_FRAMES + slack);
+    CHECK(s.live_max <= STREAM_WINDOW + 1);
+#ifndef UNDER_ASAN
+    CHECK(s.foot_growth < FOOTPRINT_BOUND);
+#endif
+
+    s = stream_file(path, mono, LONG_FRAMES / 3);
+    printf("stream %s cancelled at %lld frames: ended %.3f ms after the cancel, at frame %lld of %lld\n", what,
+           (long long)(LONG_FRAMES / 3), s.cancel_latency_ns / 1e6, (long long)s.end_frames, (long long)LONG_FRAMES);
+    CHECK(s.how == MAI_DEC_CANCELLED && s.chunks_after_cancel == 0);
+    CHECK(s.end_frames < LONG_FRAMES / 2);
+    CHECK(s.cancel_latency_ns > 0 && s.cancel_latency_ns < 100000000LL);
+}
+
+static void test_stream(const char *dir) {
+    char wav[512], m4a[512], mp3[512], cmd[2048];
+    snprintf(wav, sizeof wav, "%s/long.wav", dir);
+    snprintf(m4a, sizeof m4a, "%s/long.m4a", dir);
+    snprintf(mp3, sizeof mp3, "%s/long.mp3", dir);
+    write_wav(wav, LONG_SECONDS);
+    stream_long("wav (5 min stereo)", wav, false, 0);
+    snprintf(cmd, sizeof cmd, "afconvert -f m4af -d aac -b 128000 '%s' '%s'", wav, m4a);
+    CHECK(system(cmd) == 0 && exists(m4a));
+    stream_long("m4a (5 min, mono)", m4a, true, 2048);
+    if (make_mp3(wav, mp3)) {
+        stream_long("mp3 (5 min stereo)", mp3, false, 3 * 1152);
+    } else {
+        printf("SKIP mp3 stream: no MP3 encoder here\n");
+    }
+    unlink(wav);
+    unlink(m4a);
+    unlink(mp3);
 }
 
 /* ── Hardware (skipped without an output device) ───────────────────────── */
 
 static void test_hardware(void) {
+    if (getenv("MAI_APPLE_TEST_NO_HARDWARE")) {
+        printf("SKIP hardware: MAI_APPLE_TEST_NO_HARDWARE is set\n");
+        return;
+    }
     AudioObjectPropertyAddress a = {kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal,
                                     kAudioObjectPropertyElementMain};
     AudioDeviceID dev = kAudioObjectUnknown;
@@ -635,6 +923,7 @@ int main(int argc, char **argv) {
     test_input();
     test_duplex();
     test_decode(dir);
+    test_stream(dir);
     test_hardware();
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);

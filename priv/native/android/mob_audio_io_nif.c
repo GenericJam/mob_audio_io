@@ -26,7 +26,7 @@
  *
  * The NIF functions, the event thread and the processor registry are in
  * ../common/mai_nif.c (shared with iOS); Java (the permission, devices) is
- * in mai_jni.c, decode/2 in mai_decode.c.
+ * in mai_jni.c, file decoding (be_decode) in mai_decode.c.
  */
 #include <aaudio/AAudio.h>
 #include <android/api-level.h>

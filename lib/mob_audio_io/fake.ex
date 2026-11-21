@@ -13,8 +13,14 @@ defmodule MobAudioIo.Fake do
       with `set_input_level/2`.
     * `devices/1` lists a built-in mic and speaker unless `set_devices/2`
       replaced them.
-    * `decode/3` decodes WAV files (16-, 24- and 32-bit PCM, 32-bit float)
-      in Elixir, with the device's size cap, mono folding and errors.
+    * `decode_stream/3` decodes WAV files (16-, 24- and 32-bit PCM, 32-bit
+      float) in Elixir, in a process per decode that sends the owner what
+      a device's decode thread sends: `:decode_started`, `:decoded` chunks
+      within the window (waiting for `decode_ack/2`), the end; with the
+      same options (mono, `max_ms`), errors, `decode_cancel/1` and the
+      owner's exit. With a `processor:` (a name here) no chunks are sent,
+      as on a device where the processor takes them. `MobAudioIo.decode/2`
+      runs on it.
     * Processors are the built-ins plus whatever `register_processor/1`
       added.
 
@@ -45,13 +51,19 @@ defmodule MobAudioIo.Fake do
       fail_next: nil,
       permission: true,
       devices: @default_devices,
-      levels: %{}
+      levels: %{},
+      decodes: %{}
     }
   end
 
-  @doc "Back to no streams, the built-in processors and devices, the permission granted, no queued failure."
+  @doc "Back to no streams or decodes, the built-in processors and devices, the permission granted, no queued failure."
   @spec reset() :: :ok
-  def reset, do: update(fn _ -> initial() end)
+  def reset do
+    update(fn s ->
+      Enum.each(Map.get(s, :decodes, %{}), fn {_, pid} -> Process.exit(pid, :kill) end)
+      initial()
+    end)
+  end
 
   @doc "Make `name` openable, as an app's `mai_register` would."
   @spec register_processor(String.t()) :: :ok
@@ -190,17 +202,64 @@ defmodule MobAudioIo.Fake do
   def devices(direction), do: get(&Map.fetch!(&1.devices, direction))
 
   @impl true
-  def decode(path, max_bytes, mono) do
-    with {:ok, bin} <- read(path),
-         {:ok, fmt, data} <- MobAudioIo.Fake.Wav.parse(bin) do
-      MobAudioIo.Fake.Wav.to_f32(fmt, data, max_bytes, mono)
+  def decode_stream(path, owner, opts) do
+    ensure_started()
+
+    Agent.get_and_update(__MODULE__, fn s ->
+      cond do
+        opts.processor != "" and opts.processor not in s.processors ->
+          {{:error, :unknown_processor}, s}
+
+        map_size(s.decodes) >= 4 ->
+          {{:error, :busy}, s}
+
+        true ->
+          decode = s.next
+
+          pid =
+            spawn(fn ->
+              MobAudioIo.Fake.Decoder.run(decode, path, owner, opts, &decode_ended/1)
+            end)
+
+          {{:ok, decode}, %{s | next: decode + 1, decodes: Map.put(s.decodes, decode, pid)}}
+      end
+    end)
+  end
+
+  defp decode_ended(decode), do: update(&%{&1 | decodes: Map.delete(&1.decodes, decode)})
+
+  @impl true
+  def decode_ack(decode, n) do
+    case get(&Map.get(&1.decodes, decode)) do
+      nil ->
+        {:error, :not_running}
+
+      pid ->
+        send(pid, {:ack, n})
+        :ok
     end
   end
 
-  defp read(path) do
-    case File.read(path) do
-      {:ok, bin} -> {:ok, bin}
-      {:error, _} -> {:error, :not_found}
+  # The decode answers once it has stopped sending chunks; one that has
+  # already sent its end never answers.
+  @impl true
+  def decode_cancel(decode) do
+    case get(&Map.get(&1.decodes, decode)) do
+      nil ->
+        {:error, :not_running}
+
+      pid ->
+        ref = Process.monitor(pid)
+        send(pid, {:cancel, self(), ref})
+
+        receive do
+          {^ref, :ok} ->
+            Process.demonitor(ref, [:flush])
+            :ok
+
+          {:DOWN, ^ref, :process, _, _} ->
+            {:error, :not_running}
+        end
     end
   end
 
