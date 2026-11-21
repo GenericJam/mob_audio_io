@@ -117,6 +117,7 @@ typedef struct {
     int32_t channels;
     double phase;
     bool fail;
+    UInt32 short_by; /* frames to leave out (the simulator's 557-of-558) */
 } source;
 
 static OSStatus source_render(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
@@ -130,6 +131,7 @@ static OSStatus source_render(void *ref, AudioUnitRenderActionFlags *flags, cons
         src->phase += 2 * M_PI * 1000.0 / RATE;
         for (int32_t c = 0; c < src->channels; c++) x[i * (UInt32)src->channels + (UInt32)c] = v;
     }
+    if (src->short_by) io->mBuffers[0].mDataByteSize = (n - src->short_by) * (UInt32)src->channels * sizeof(float);
     return noErr;
 }
 
@@ -297,7 +299,7 @@ static void test_input(void) {
         probe p;
         mai_stream *s = open_stream(&p, MAI_DIR_IN, 2, ch);
         atomic_store(&s->in_latency_ns, 3000000);
-        source src = {NULL, ch, 0, false};
+        source src = {NULL, ch, 0, false, 0};
         src.unit = generic_unit(ch, source_render, &src, true);
         mai_apple_io *io = mai_apple_io_new(s);
         CHECK(io && io->in && io->in_cap == MAX_FRAMES_PER_SLICE && io->in_bus == 1);
@@ -346,7 +348,7 @@ static void test_duplex(void) {
     mai_stream *s = open_stream(&p, MAI_DIR_DUPLEX, 2, 1);
     atomic_store(&s->out_latency_ns, 7000000);
     atomic_store(&s->in_latency_ns, 4000000);
-    source src = {NULL, 1, 0, false};
+    source src = {NULL, 1, 0, false, 0};
     src.unit = generic_unit(1, source_render, &src, true);
     mai_apple_io *io = mai_apple_io_new(s);
     char err[MAI_ERRMAX] = "";
@@ -386,6 +388,16 @@ static void test_duplex(void) {
     CHECK(p.captures == 2 && p.renders == 2 && p.frame_c == 256 && p.in_sum_sq == 0.0);
     CHECK(atomic_load(&s->in_underflows) == 1 && atomic_load(&s->be_xruns) == 0);
     CHECK(out[0] == 0.001f);
+
+    /* the input comes a frame short (if the unit passes the short buffer
+     * on): the frames it gave, a zero for the missing one, counted */
+    src.fail = false;
+    src.short_by = 1;
+    ts = stamp(512, host + 20);
+    abl.mBuffers[0].mDataByteSize = sizeof out;
+    CHECK(AudioUnitRender(io->unit, &flags, &ts, 0, 256, &abl) == noErr);
+    CHECK(p.captures == 3 && p.in_sum_sq > 0.0 && atomic_load(&s->in_underflows) == 2);
+    CHECK(io->in[255] == 0.0f && io->in[254] != 0.0f);
 
     mai_apple_io_free(io);
     AudioUnitUninitialize(src.unit);

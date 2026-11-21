@@ -57,21 +57,23 @@ static void mai_apple_count_gap(mai_stream *s, const AudioTimeStamp *ts, UInt32 
     s->last_frames = n;
 }
 
-/* Pull n input frames into io->in: false (and io->in zeroed) when the unit
- * had none to give. */
-static bool mai_apple_pull_input(mai_apple_io *io, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts,
-                                 UInt32 n) {
-    UInt32 bytes = n * (UInt32)io->s->in_channels * (UInt32)sizeof(float);
+/* Pull n input frames into io->in: the frames the unit gave, with the rest
+ * zeroed (all of them when the render failed). The simulator's input can
+ * come a frame short of its output's 557/558-frame blocks. */
+static UInt32 mai_apple_pull_input(mai_apple_io *io, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts,
+                                   UInt32 n) {
+    UInt32 frame_bytes = (UInt32)io->s->in_channels * (UInt32)sizeof(float), bytes = n * frame_bytes;
     io->in_abl.mNumberBuffers = 1;
     io->in_abl.mBuffers[0].mNumberChannels = (UInt32)io->s->in_channels;
     io->in_abl.mBuffers[0].mDataByteSize = bytes;
     io->in_abl.mBuffers[0].mData = io->in;
     AudioUnitRenderActionFlags f = flags ? *flags : 0;
-    if (AudioUnitRender(io->in_unit, &f, ts, io->in_bus, n, &io->in_abl) == noErr &&
-        io->in_abl.mBuffers[0].mDataByteSize >= bytes)
-        return true;
-    memset(io->in, 0, bytes);
-    return false;
+    UInt32 got = 0;
+    if (AudioUnitRender(io->in_unit, &f, ts, io->in_bus, n, &io->in_abl) == noErr)
+        got = io->in_abl.mBuffers[0].mDataByteSize / frame_bytes;
+    if (got > n) got = n;
+    if (got < n) memset((char *)io->in + got * frame_bytes, 0, (n - got) * frame_bytes);
+    return got;
 }
 
 /* Output and duplex: the unit asks for n frames of bus 0. A duplex stream
@@ -95,7 +97,7 @@ static OSStatus mai_apple_render(void *ref, AudioUnitRenderActionFlags *flags, c
             atomic_fetch_add_explicit(&s->in_underflows, 1, memory_order_relaxed);
             return noErr;
         }
-        if (!mai_apple_pull_input(io, flags, ts, n))
+        if (mai_apple_pull_input(io, flags, ts, n) < n) /* short: the rest is zeros */
             atomic_fetch_add_explicit(&s->in_underflows, 1, memory_order_relaxed);
         in = io->in;
         in_present = host ? host - atomic_load_explicit(&s->in_latency_ns, memory_order_relaxed) : 0;
@@ -116,13 +118,12 @@ static OSStatus mai_apple_input(void *ref, AudioUnitRenderActionFlags *flags, co
         atomic_fetch_add_explicit(&s->be_xruns, 1, memory_order_relaxed);
         return noErr;
     }
-    if (!mai_apple_pull_input(io, flags, ts, n)) {
-        atomic_fetch_add_explicit(&s->be_xruns, 1, memory_order_relaxed); /* the frames are lost */
-        return noErr;
-    }
+    UInt32 got = mai_apple_pull_input(io, flags, ts, n);
+    if (got < n) atomic_fetch_add_explicit(&s->be_xruns, 1, memory_order_relaxed); /* frames lost */
+    if (got == 0) return noErr;
     int64_t host = mai_apple_host_ns(ts);
     int64_t in_present = host ? host - atomic_load_explicit(&s->in_latency_ns, memory_order_relaxed) : 0;
-    mai__process(s, io->in, NULL, (int32_t)n, t0, in_present, 0);
+    mai__process(s, io->in, NULL, (int32_t)got, t0, in_present, 0);
     return noErr;
 }
 

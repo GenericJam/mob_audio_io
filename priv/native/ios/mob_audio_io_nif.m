@@ -108,8 +108,12 @@ static void observe_session(void) {
                    * (iOS 14.5+) is stale: the interruption may be long over
                    * and no "ended" will follow. Try to rebuild right away. */
                   NSNumber *reason = n.userInfo[AVAudioSessionInterruptionReasonKey];
+                  /* (deprecated in iOS 16, which no longer sends it: iOS 15 does) */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
                   bool suspended =
                       reason && reason.unsignedIntegerValue == AVAudioSessionInterruptionReasonAppWasSuspended;
+#pragma clang diagnostic pop
                   flag_all(MAI_PF_INTERRUPTED | (suspended ? MAI_PF_FOREGROUND : 0));
                 }];
     /* An interruption whose "ended" never came (the app was in the
@@ -205,7 +209,11 @@ static void follow_open_streams(void) {
 static bool record_granted(void) {
     if (@available(iOS 17.0, *))
         return [AVAudioApplication sharedInstance].recordPermission == AVAudioApplicationRecordPermissionGranted;
+    /* (iOS 15-16; deprecated from 17, which mob_dev's simulator build targets) */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     return [AVAudioSession sharedInstance].recordPermission == AVAudioSessionRecordPermissionGranted;
+#pragma clang diagnostic pop
 }
 
 /* (g_lock held, the session PlayAndRecord and active) The input s asked for
