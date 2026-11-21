@@ -439,10 +439,11 @@ static const char *port_kind(AVAudioSessionPort t) {
 /* :input: the session's available inputs (their UIDs are what :device
  * takes); :output: the current route's outputs (iOS picks them).
  * availableInputs is empty unless the category records (QA1799): with no
- * session active, set PlayAndRecord (not activated) first, and mark the
- * session stale so the next open applies its own. While streams hold an
- * active session of another category, switching it would reroute them:
- * the list is what iOS gives then (often empty; open an input first). */
+ * session active, switch to PlayAndRecord (not activated) just to read
+ * them, then put back the app's category, mode and options (the array is a
+ * snapshot), so other code (AVPlayer) finds them unchanged. While streams
+ * hold an active session of another category, switching it would reroute
+ * them: the list is what iOS gives then (often empty; open an input first). */
 static ERL_NIF_TERM be_devices(ErlNifEnv *env, int dir) {
     @autoreleasepool {
         AVAudioSession *as = [AVAudioSession sharedInstance];
@@ -450,16 +451,26 @@ static ERL_NIF_TERM be_devices(ErlNifEnv *env, int dir) {
         if (dir == MAI_DIR_IN) {
             pthread_mutex_lock(&g_lock);
             if (!g_session_active && ![as.category isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
+                AVAudioSessionCategory cat = as.category;
+                AVAudioSessionMode mode = as.mode;
+                AVAudioSessionCategoryOptions opts = as.categoryOptions;
                 NSError *err = nil;
-                if (![as setCategory:AVAudioSessionCategoryPlayAndRecord
-                                mode:AVAudioSessionModeDefault
-                             options:AVAudioSessionCategoryOptionDefaultToSpeaker |
-                                     AVAudioSessionCategoryOptionAllowBluetoothA2DP
-                               error:&err])
+                if ([as setCategory:AVAudioSessionCategoryPlayAndRecord
+                               mode:AVAudioSessionModeDefault
+                            options:AVAudioSessionCategoryOptionDefaultToSpeaker |
+                                    AVAudioSessionCategoryOptionAllowBluetoothA2DP
+                              error:&err]) {
+                    ports = as.availableInputs;
+                    if (![as setCategory:cat mode:mode options:opts error:&err])
+                        set_ns_error(NULL, "setCategory (devices, restore)", err);
+                } else {
                     set_ns_error(NULL, "setCategory (devices)", err);
-                g_session_applied = false;
+                    ports = as.availableInputs;
+                }
+                g_session_applied = false; /* (idle: the next open applies its own anyway) */
+            } else {
+                ports = as.availableInputs;
             }
-            ports = as.availableInputs;
             pthread_mutex_unlock(&g_lock);
         } else {
             ports = as.currentRoute.outputs;
