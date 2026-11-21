@@ -71,10 +71,12 @@ On a device: `cd example`, zig **0.17.0** first on `PATH`
 
 ## Releases
 
-Bumping `version` in `mix.exs` on `main` publishes to Hex
-(`.github/workflows/release.yml`). Bump only when the latest `tests` run on
-`main` is green; say so with `@all` on Muster `#mob` first; then watch the
-`release` and `tests` runs and confirm with `mix hex.info mob_audio_io`.
+Bumping `version` in `mix.exs` on `main` publishes to Hex through
+`.github/workflows/release.yml` (added with the 0.1.0 bump; it needs the
+`HEX_API_KEY` and `MOB_PLUGIN_SIGN_KEY` repo secrets). Bump only when the
+latest `tests` run on `main` is green; say so with `@all` on Muster `#mob`
+first; then watch the `release` and `tests` runs and confirm with
+`mix hex.info mob_audio_io`.
 
 ## Gotchas
 

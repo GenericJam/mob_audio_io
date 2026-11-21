@@ -7,9 +7,10 @@ defmodule AudioIoSpike.HomeScreen do
     Mob.Theme.set(theme_to_module(theme))
     # Activated plugins that ship a demo screen show up here automatically —
     # no edits needed when you add or remove one in mob.exs.
-    # The verification's input and duplex streams need the microphone:
-    # ask once at start (mob_audio_io answers {:error, :permission} until then).
-    socket = Mob.Permissions.request(socket, :microphone)
+    # The verification's input and duplex streams need the microphone: ask
+    # once at start, after mount (the NIF isn't there in host tests;
+    # mob_audio_io answers {:error, :permission} until it's granted).
+    send(self(), :ask_microphone)
 
     {:ok,
      Mob.Socket.assign(socket,
@@ -61,6 +62,9 @@ defmodule AudioIoSpike.HomeScreen do
       nil -> {:noreply, socket}
     end
   end
+
+  def handle_info(:ask_microphone, socket),
+    do: {:noreply, Mob.Permissions.request(socket, :microphone)}
 
   def handle_info({:permission, :microphone, status}, socket),
     do: {:noreply, Mob.Socket.assign(socket, :microphone, status)}

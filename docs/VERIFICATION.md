@@ -1,20 +1,21 @@
 # mob_audio_io: device verification
 
 What the example app (`example/`, `com.genericjam.audioiospike`) measured
-with the full plugin (main at 8f1905e: PRs #1-#3), through
-`AudioIoSpike.Probe.run_all/0` over RPC. Each run: the self-test, the
-devices and processors, 60 s of output (`spike_click`, posting a message per
-click), 60 s of input (`tone_loop`, the plugin's meter and a pitch estimate
-once a second), 10 s of a 1 kHz tone played through the speaker and heard
-back through the microphone (duplex `tone_loop`), 15 s of a burst a second
-whose acoustic round trip the capture times (duplex `loop_latency`), and
-decoding a WAV, an MP3 and an M4A shipped in `priv/audio`. Worst-case
-counters are zeroed 1 s after each open.
+with the full plugin, through `AudioIoSpike.Probe.run_all/0` over RPC. A
+full run: the self-test, the devices and processors, 60 s of output
+(`spike_click`, posting a message per click), 60 s of input (`tone_loop`,
+the plugin's meter and a pitch estimate once a second), 10 s of a 1 kHz tone
+played through the speaker and heard back through the microphone (duplex
+`tone_loop`), 15 s of a burst a second whose acoustic round trip the capture
+times (duplex `loop_latency`), and decoding a WAV, an MP3 and an M4A shipped
+in `priv/audio`. Worst-case counters are zeroed 1 s after each open.
 
-**Interrupted:** at 10:33 UTC Kevin paused all device audio while the moto e
-and iPhone SE runs of the final build were pending. What ran before that is
-below; the rows marked *pending* need the final build re-run once audio may
-resume (MOB-546).
+**Only the moto g power column is a full run of the final build** (main
+8f1905e, PRs #1-#3). The simulator column is a full run with the final iOS
+code. At 10:33 UTC Kevin paused all device audio while the moto e and iPhone
+SE runs of the final build were pending: their columns come from earlier
+builds and shorter runs (named in the "build" row) and the whole columns
+need a re-run of the final build once audio may resume (MOB-546).
 
 ## Results
 
@@ -279,10 +280,8 @@ Left for the full plugin:
 
 ## How to reproduce
 
-See `AGENTS.md` (Testing). In short: `cd example`, zig 0.17.0 on `PATH`,
-lease the device, `mix mob.deploy --native --android --device <serial>`,
-`mix mob.connect --no-iex`, then
-`mix run --no-start scripts/rpc.exs <node> 'AudioIoSpike.Probe.run("spike_click", 60)' 90000`.
-For the iPhone: copy an empty `Documents/mai_probe_request` into the app's
-container with `xcrun devicectl device copy to`, relaunch, and copy
-`Documents/mai_probe_result.txt` back two and a half minutes later.
+See `AGENTS.md` (Testing): deploy `example/` and run
+`AudioIoSpike.Probe.run_all()` (or `output/3`, `input/2`, `tone/3`,
+`loopback/2`, `decode_all/0`) through `scripts/rpc.exs`; on an iPhone with
+`--iphone <udid>`. (The spike's file-triggered probe described above is
+gone.)
