@@ -6,7 +6,8 @@ name: tests
 # compile each platform's NIF with that platform's compiler and check that
 # every function priv/include/mob_audio_io.h declares is defined in it; the
 # last runs the iOS backend's plain C (priv/native/ios/mai_apple.c) against
-# macOS's CoreAudio.
+# macOS's CoreAudio, and the NIF's file decoding (decode_stream/3 and the
+# rest, built for the host with that ExtAudioFile decode) in a host BEAM.
 
 on:
   push:
@@ -114,7 +115,7 @@ jobs:
           done
 
   macos-coreaudio:
-    name: iOS core on macOS CoreAudio (callbacks through real AudioUnits, ExtAudioFile decode)
+    name: iOS core on macOS CoreAudio (callbacks through real AudioUnits, ExtAudioFile streaming decode)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -130,3 +131,24 @@ jobs:
             test/c/mai_apple_test.c -o mai_apple_test \
             -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
           ./mai_apple_test "$RUNNER_TEMP/mai_apple_test"
+
+      # Without ASan, whose quarantine keeps freed chunks resident, the test
+      # also holds the streaming decode's footprint under its bound.
+      - name: priv/native/ios/mai_apple.c optimised (the streaming decode's memory bound)
+        run: |
+          clang -std=c11 -Wall -Wextra -Werror -Wno-unused-function -O2 \
+            test/c/mai_apple_test.c -o mai_apple_test_o2 \
+            -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
+          ./mai_apple_test_o2 "$RUNNER_TEMP/mai_apple_test_o2"
+
+      - name: Erlang + Elixir
+        run: brew install elixir
+
+      - name: The NIF's decode_stream in a host BEAM (test/host_nif_smoke.exs)
+        run: |
+          ERTS=$(erl -noshell -eval 'io:format("~s/erts-~s/include",[code:root_dir(),erlang:system_info(version)]),halt().')
+          mkdir -p "$RUNNER_TEMP/nif"
+          clang -std=c11 -Wall -Wextra -Werror -Wno-unused-function -O2 -dynamiclib -undefined dynamic_lookup \
+            -I"$ERTS" test/c/mai_nif_host.c -o "$RUNNER_TEMP/nif/mob_audio_io_nif.so" \
+            -framework AudioToolbox -framework CoreFoundation
+          elixir test/host_nif_smoke.exs "$RUNNER_TEMP/nif" "$RUNNER_TEMP/nif/work"

@@ -54,6 +54,22 @@ MobAudioIo.devices(:input)  # [%{id: 7, name: "USB-C headset", kind: :usb}, ...]
 MobAudioIo.close(stream)
 ```
 
+Decoding a long file without holding all of it (analyse as it decodes, stop
+at any time):
+
+```elixir
+{:ok, d} = MobAudioIo.decode_stream("/path/song.m4a", self(), mono: true, max_ms: 600_000)
+# {:mob_audio_io, :decode_started, d, %{rate: 44100, channels: 1, frames: 26_460_000}}
+# {:mob_audio_io, :decoded, d, f32_chunk}   analyse it, then MobAudioIo.decode_ack(d)
+#                                            (at most `window:` chunks, default 4, wait unacknowledged)
+# {:mob_audio_io, :decode_done, d, %{frames: n, rate: r, channels: 1}}  (or :decode_cancelled, :decode_error)
+MobAudioIo.decode_cancel(d)  # stops within one codec buffer; only :decode_cancelled follows
+```
+
+With `processor: "my_analysis"` the chunks go straight to that processor's
+`capture` on the decode's thread instead (C analysis that never enters the
+BEAM; `priv/include/mob_audio_io.h` has the calls).
+
 The moduledoc of `MobAudioIo` has the options, the messages, the errors, the
 iOS session policy, background audio and the platform table. In tests,
 `config :mob_audio_io, backend: MobAudioIo.Fake`.

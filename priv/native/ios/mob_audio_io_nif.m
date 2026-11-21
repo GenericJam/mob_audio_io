@@ -486,6 +486,6 @@ static ERL_NIF_TERM be_devices(ErlNifEnv *env, int dir) {
     }
 }
 
-static const char *be_decode(const char *path, mai_pcm *pcm, int32_t *rate, char *detail, size_t detail_n) {
-    return mai_apple_decode(path, pcm, rate, detail, detail_n);
+static const char *be_decode(const char *path, mai_decode *d, char *detail, size_t detail_n) {
+    return mai_apple_decode(path, d, detail, detail_n);
 }

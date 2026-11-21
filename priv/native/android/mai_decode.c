@@ -1,6 +1,7 @@
 /*
- * mai_decode.c (Android): decode/2 with AMediaExtractor + AMediaCodec (WAV,
- * MP3, AAC/M4A, FLAC, Ogg: whatever the phone's decoders take). Included by
+ * mai_decode.c (Android): be_decode, the streaming decode's platform half,
+ * with AMediaExtractor + AMediaCodec (WAV, MP3, AAC/M4A, FLAC, Ogg: whatever
+ * the phone's decoders take), on the decode's own thread. Included by
  * mob_audio_io_nif.c after ../common/mai_nif.c; ported from Humdinger's
  * and Magpie's decode_file.
  *
@@ -40,6 +41,7 @@ static struct {
     __typeof__(AMediaExtractor_advance) *exAdvance;
     __typeof__(AMediaFormat_getString) *fmtGetString;
     __typeof__(AMediaFormat_getInt32) *fmtGetInt32;
+    __typeof__(AMediaFormat_getInt64) *fmtGetInt64;
     __typeof__(AMediaFormat_delete) *fmtDelete;
     __typeof__(AMediaCodec_createDecoderByType) *codecCreateDecoderByType;
     __typeof__(AMediaCodec_configure) *codecConfigure;
@@ -73,6 +75,7 @@ static void media_load(void) {
     S(exAdvance, "AMediaExtractor_advance");
     S(fmtGetString, "AMediaFormat_getString");
     S(fmtGetInt32, "AMediaFormat_getInt32");
+    S(fmtGetInt64, "AMediaFormat_getInt64");
     S(fmtDelete, "AMediaFormat_delete");
     S(codecCreateDecoderByType, "AMediaCodec_createDecoderByType");
     S(codecConfigure, "AMediaCodec_configure");
@@ -90,23 +93,12 @@ static void media_load(void) {
     M.ok = true;
 }
 
-/* A MAI_PCM_* result as decode's error, with its detail. */
-static const char *pcm_failure(int r, char *detail, size_t detail_n) {
-    switch (r) {
-    case MAI_PCM_TOO_LARGE: return "too_large";
-    case MAI_PCM_NO_MEMORY: return "no_memory";
-    default:
-        snprintf(detail, detail_n, "the channel count changed mid-file");
-        return "decode_error";
-    }
-}
-
 /* Little-endian 8-bit unsigned, 24-bit packed or 32-bit integer frames into
- * `pcm`, through a stack buffer of floats. */
-static int push_converted(mai_pcm *pcm, const uint8_t *x, size_t frames, int32_t ch, int32_t enc) {
+ * `d`, through a stack buffer of floats. */
+static int push_converted(mai_decode *d, const uint8_t *x, size_t frames, int32_t ch, int32_t enc) {
     float tmp[4096];
     size_t per = sizeof tmp / sizeof tmp[0] / (size_t)ch;
-    if (per == 0) return MAI_PCM_CHANNELS;
+    if (per == 0) return MAI_DEC_FORMAT;
     size_t bps = enc == ENC_PCM_8BIT ? 1 : enc == ENC_PCM_24BIT_PACKED ? 3 : 4;
     for (size_t done = 0; done < frames;) {
         size_t n = frames - done < per ? frames - done : per;
@@ -123,20 +115,20 @@ static int push_converted(mai_pcm *pcm, const uint8_t *x, size_t frames, int32_t
                 tmp[i] = (float)(v / 2147483648.0);
             }
         }
-        int r = mai__pcm_push_f32(pcm, tmp, n, ch);
-        if (r != MAI_PCM_OK) return r;
+        int r = mai__dec_push_f32(d, tmp, n, ch);
+        if (r != MAI_DEC_GO) return r;
         done += n;
     }
-    return MAI_PCM_OK;
+    return MAI_DEC_GO;
 }
 
-static int push_block(mai_pcm *pcm, const uint8_t *x, size_t bytes, int32_t ch, int32_t enc) {
+static int push_block(mai_decode *d, const uint8_t *x, size_t bytes, int32_t ch, int32_t enc) {
     size_t bps = enc == ENC_PCM_16BIT ? 2 : enc == ENC_PCM_8BIT ? 1 : enc == ENC_PCM_24BIT_PACKED ? 3 : 4;
     size_t frames = bytes / (bps * (size_t)ch);
-    if (frames == 0) return MAI_PCM_OK;
-    if (enc == ENC_PCM_16BIT) return mai__pcm_push_s16(pcm, (const int16_t *)(const void *)x, frames, ch);
-    if (enc == ENC_PCM_FLOAT) return mai__pcm_push_f32(pcm, (const float *)(const void *)x, frames, ch);
-    return push_converted(pcm, x, frames, ch, enc);
+    if (frames == 0) return MAI_DEC_GO;
+    if (enc == ENC_PCM_16BIT) return mai__dec_push_s16(d, (const int16_t *)(const void *)x, frames, ch);
+    if (enc == ENC_PCM_FLOAT) return mai__dec_push_f32(d, (const float *)(const void *)x, frames, ch);
+    return push_converted(d, x, frames, ch, enc);
 }
 
 static bool encoding_known(int32_t enc) {
@@ -144,8 +136,9 @@ static bool encoding_known(int32_t enc) {
            enc == ENC_PCM_32BIT;
 }
 
-/* (no lock; a dirty IO scheduler) */
-static const char *be_decode(const char *path, mai_pcm *pcm, int32_t *rate, char *detail, size_t detail_n) {
+/* (no lock; the decode's own thread) Stops at the next codec buffer once
+ * the decode is cancelled: a dequeue waits at most DEQUEUE_US. */
+static const char *be_decode(const char *path, mai_decode *d, char *detail, size_t detail_n) {
     pthread_once(&g_media_once, media_load);
     if (!M.ok) {
         snprintf(detail, detail_n, "libmediandk.so could not be loaded");
@@ -157,7 +150,7 @@ static const char *be_decode(const char *path, mai_pcm *pcm, int32_t *rate, char
         return "not_found";
     }
     /* fstat64: a 32-bit off_t can't hold a file over 2 GiB (EOVERFLOW);
-     * such a file decodes until the cap (too_large) like any other. */
+     * such a file decodes like any other. */
     struct stat64 st;
     int stat_rc = fstat64(fd, &st);
     if (stat_rc != 0 || !S_ISREG(st.st_mode)) {
@@ -180,6 +173,7 @@ static const char *be_decode(const char *path, mai_pcm *pcm, int32_t *rate, char
 
     AMediaCodec *codec = NULL;
     int32_t track_rate = 0, channels = 0;
+    int64_t duration_us = 0;
     char mime[64] = "";
     const char *failure = NULL;
     size_t tracks = M.exGetTrackCount(ex);
@@ -190,6 +184,7 @@ static const char *be_decode(const char *path, mai_pcm *pcm, int32_t *rate, char
             snprintf(mime, sizeof mime, "%s", m);
             M.fmtGetInt32(f, "sample-rate", &track_rate);
             M.fmtGetInt32(f, "channel-count", &channels);
+            M.fmtGetInt64(f, "durationUs", &duration_us);
             M.exSelectTrack(ex, i);
             codec = M.codecCreateDecoderByType(mime);
             if (!codec) {
@@ -220,6 +215,10 @@ static const char *be_decode(const char *path, mai_pcm *pcm, int32_t *rate, char
     bool input_done = false, eos = false;
     int idle = 0;
     while (!failure && !eos) {
+        if (mai__dec_stopping(d)) {
+            failure = "cancelled";
+            break;
+        }
         bool progress = false;
         if (!input_done) {
             ssize_t in = M.codecDequeueInputBuffer(codec, DEQUEUE_US);
@@ -255,7 +254,7 @@ static const char *be_decode(const char *path, mai_pcm *pcm, int32_t *rate, char
             int32_t v = 0;
             if (f && M.fmtGetInt32(f, "channel-count", &v) && v > 0) out_channels = v;
             /* (HE-AAC decodes at twice the container's rate) */
-            if (f && pcm->frames == 0 && M.fmtGetInt32(f, "sample-rate", &v) && v > 0) out_rate = v;
+            if (f && !d->begun && M.fmtGetInt32(f, "sample-rate", &v) && v > 0) out_rate = v;
             enc = f && M.fmtGetInt32(f, "pcm-encoding", &v) ? v : ENC_PCM_16BIT;
             if (f) M.fmtDelete(f);
             if (!encoding_known(enc)) {
@@ -287,20 +286,21 @@ static const char *be_decode(const char *path, mai_pcm *pcm, int32_t *rate, char
             failure = "decode_error";
             break;
         }
-        int r = push_block(pcm, buf + info.offset, (size_t)info.size, out_channels, enc);
+        int r = MAI_DEC_GO;
+        if (!d->begun && info.size > 0) {
+            /* the decoder's rate (HE-AAC's is twice the track's), its stated length at that rate */
+            int64_t declared = duration_us > 0 && out_rate > 0 ? duration_us * out_rate / 1000000 : -1;
+            r = mai__dec_begin(d, out_rate, out_channels, declared);
+        }
+        if (r == MAI_DEC_GO) r = push_block(d, buf + info.offset, (size_t)info.size, out_channels, enc);
         eos = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
         M.codecReleaseOutputBuffer(codec, (size_t)out, false);
-        if (r != MAI_PCM_OK) failure = pcm_failure(r, detail, detail_n);
+        if (r != MAI_DEC_GO) failure = mai__dec_reason(r, detail, detail_n);
     }
 
     M.codecStop(codec);
     M.codecDelete(codec);
     M.exDelete(ex);
     close(fd);
-    *rate = out_rate;
-    if (!failure && out_rate <= 0) {
-        snprintf(detail, detail_n, "no sample rate");
-        failure = "decode_error";
-    }
     return failure;
 }

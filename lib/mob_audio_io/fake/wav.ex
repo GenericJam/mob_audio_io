@@ -1,8 +1,8 @@
 defmodule MobAudioIo.Fake.Wav do
   @moduledoc false
   # The Fake's decoder: RIFF/WAVE with 16-, 24- or 32-bit integer PCM or
-  # 32-bit float data, to the same result `MobAudioIo.decode/2` gives on a
-  # device (interleaved native-endian f32, the size cap, mono folding).
+  # 32-bit float data, to the PCM a device's decode gives (interleaved
+  # native-endian f32, mono folding).
 
   @pcm 1
   @float 3
@@ -62,24 +62,19 @@ defmodule MobAudioIo.Fake.Wav do
 
   defp sub_format(_), do: 0
 
-  @spec to_f32(map(), binary(), pos_integer(), boolean()) :: {:ok, map()} | {:error, atom()}
-  def to_f32(%{bits: bits, channels: ch, rate: rate} = fmt, data, max_bytes, mono) do
+  @spec to_f32(map(), binary(), boolean()) :: {:ok, map()} | {:error, atom()}
+  def to_f32(%{bits: bits, channels: ch, rate: rate} = fmt, data, mono) do
     frame_bytes = div(bits, 8) * ch
     frames = div(byte_size(data), frame_bytes)
     out_ch = if mono, do: 1, else: ch
 
-    cond do
-      frames == 0 ->
-        {:error, :no_audio}
-
-      frames * out_ch * 4 > max_bytes ->
-        {:error, :too_large}
-
-      true ->
-        samples = samples(fmt, binary_part(data, 0, frames * frame_bytes))
-        samples = if mono, do: fold(samples, ch), else: samples
-        out = for x <- samples, into: <<>>, do: <<x::float-32-native>>
-        {:ok, %{rate: rate, channels: out_ch, frames: frames, data: out}}
+    if frames == 0 do
+      {:error, :no_audio}
+    else
+      samples = samples(fmt, binary_part(data, 0, frames * frame_bytes))
+      samples = if mono, do: fold(samples, ch), else: samples
+      out = for x <- samples, into: <<>>, do: <<x::float-32-native>>
+      {:ok, %{rate: rate, channels: out_ch, frames: frames, data: out}}
     end
   end
 

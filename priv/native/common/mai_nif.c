@@ -27,7 +27,16 @@
  *   {:mob_audio_io, :error, id, %{reason: atom, detail: string, while: atom}}  a reopen failed (retried)
  *   {:mob_audio_io, :post, id, binary}          mai_post from the processor
  *
- * Every message but :post is also sent to the logger process set with
+ * File decodes (decode_stream/3) run on a thread each (decode_main), and
+ * send their owner, from that thread:
+ *
+ *   {:mob_audio_io, :decode_started, id, %{rate, channels, frames}}  frames: the stated length or nil
+ *   {:mob_audio_io, :decoded, id, binary}       a chunk of f32 frames (unless a processor takes them)
+ *   {:mob_audio_io, :decode_done, id, %{frames, rate, channels}}
+ *   {:mob_audio_io, :decode_cancelled, id, %{frames}}
+ *   {:mob_audio_io, :decode_error, id, %{reason, detail, frames}}
+ *
+ * Every message but :post and :decoded is also sent to the logger process set with
  * set_logger/1 (MobAudioIo.Log), which logs it with a [mob_audio_io] prefix:
  * native code can't reach Sloppy Joe's `logs`.
  */
@@ -68,10 +77,14 @@ static ERL_NIF_TERM be_session_term(ErlNifEnv *env);
 /* (no lock) The devices of a direction (MAI_DIR_IN / MAI_DIR_OUT):
  * [%{id, name, kind}] or {:error, reason}. */
 static ERL_NIF_TERM be_devices(ErlNifEnv *env, int dir);
-/* (no lock) Decode `path` into `pcm`, setting `*rate`. NULL or an error
- * atom (:not_found, :unsupported, :no_audio, :too_large, :no_memory,
- * :decode_error), with a platform detail in `detail` (may stay empty). */
-static const char *be_decode(const char *path, mai_pcm *pcm, int32_t *rate, char *detail, size_t detail_n);
+/* (no lock; the decode's own thread) Decode `path` into `d`: mai__dec_begin
+ * once the format is known, then mai__dec_push_* per codec buffer, checking
+ * mai__dec_stopping(d) every buffer and stopping when a push answers
+ * anything but MAI_DEC_GO (mai__dec_reason names it). NULL at the end of
+ * the file, or an error atom (:not_found, :unsupported, :no_audio,
+ * :too_long, :no_memory, :decode_error, or "cancelled"), with a platform
+ * detail in `detail` (may stay empty). */
+static const char *be_decode(const char *path, mai_decode *d, char *detail, size_t detail_n);
 
 /* ── State ─────────────────────────────────────────────────────────────── */
 
@@ -701,54 +714,207 @@ static ERL_NIF_TERM nif_devices(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     return be_devices(env, d);
 }
 
-/* The decode's buffer is an ErlNifBinary, grown in place. */
-typedef struct {
-    ErlNifBinary bin;
-    bool alloced;
-} pcm_bin;
+/* ── Decodes ───────────────────────────────────────────────────────────── */
 
-static bool pcm_grow(mai_pcm *p, size_t bytes) {
-    pcm_bin *b = p->user;
-    if (!b->alloced) {
-        if (!enif_alloc_binary(bytes, &b->bin)) return false;
-        b->alloced = true;
-    } else if (!enif_realloc_binary(&b->bin, bytes)) {
-        return false;
-    }
-    p->data = (float *)b->bin.data;
-    p->cap = bytes;
-    return true;
+/* A decode's sink state (mai_decode.user): its owner and messages. */
+typedef struct {
+    ErlNifPid owner;
+    ErlNifPid logger;
+    bool have_logger;
+    ErlNifEnv *env;   /* the messages' */
+    ErlNifBinary bin; /* the chunk being filled */
+    bool have_bin;
+    void *mon; /* the owner's monitor (mai_dec_mon) */
+    ErlNifMonitor mref;
+    bool monitored;
+    char path[4096]; /* (MobAudioIo refuses longer paths) */
+} mai_dec_owner;
+
+typedef struct {
+    int32_t id;
+} mai_dec_mon;
+
+static ErlNifResourceType *g_dec_mon_type;
+
+/* The owner exited: the decode stops (its end goes nowhere). */
+static void dec_mon_down(ErlNifEnv *env, void *obj, ErlNifPid *pid, ErlNifMonitor *mon) {
+    (void)env; (void)pid; (void)mon;
+    mai__dec_cancel(((mai_dec_mon *)obj)->id);
 }
 
-/* decode(path, max_bytes, mono) -> {:ok, %{rate, channels, frames, data}}
- *   | {:error, reason} | {:error, {reason, detail}} (a dirty IO job) */
-static ERL_NIF_TERM nif_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
-    char path[4096]; /* (MobAudioIo.decode/2 refuses longer paths) */
-    ErlNifUInt64 max_bytes;
-    char mono[8];
-    if (!get_string(env, argv[0], path, sizeof path) || !path[0] || !enif_get_uint64(env, argv[1], &max_bytes) ||
-        !get_atom(env, argv[2], mono, sizeof mono))
-        return enif_make_badarg(env);
-    pcm_bin b = {.alloced = false};
-    mai_pcm pcm = {.max_bytes = (size_t)max_bytes, .mono = strcmp(mono, "true") == 0, .grow = pcm_grow, .user = &b};
-    int32_t rate = 0;
-    char detail[MAI_ERRMAX] = "";
-    const char *err = be_decode(path, &pcm, &rate, detail, sizeof detail);
-    if (!err && pcm.frames == 0) err = "no_audio";
-    if (err) {
-        if (b.alloced) enif_release_binary(&b.bin);
-        return error_detail(env, err, detail);
+/* `caller`: the NIF's env, or NULL on the decode's thread. */
+static void dec_owner_free(ErlNifEnv *caller, mai_dec_owner *u) {
+    if (u->monitored) enif_demonitor_process(caller, u->mon, &u->mref);
+    if (u->mon) enif_release_resource(u->mon);
+    if (u->env) enif_free_env(u->env);
+    free(u);
+}
+
+/* {:mob_audio_io, kind, id, payload} to the owner (and, when `log`, the
+ * logger). Whether the owner got it. Under g_dec_lock (the sink's calls). */
+static bool dec_send(mai_decode *d, const char *kind, ERL_NIF_TERM payload, bool log) {
+    mai_dec_owner *u = d->user;
+    ErlNifEnv *env = u->env;
+    ERL_NIF_TERM msg = enif_make_tuple4(env, atom(env, "mob_audio_io"), atom(env, kind), enif_make_int(env, d->id),
+                                        payload);
+    if (log && u->have_logger) {
+        ErlNifEnv *le = enif_alloc_env();
+        if (le) {
+            enif_send(NULL, &u->logger, le, enif_make_copy(le, msg));
+            enif_free_env(le);
+        }
     }
-    size_t bytes = pcm.frames * (size_t)pcm.channels * sizeof(float);
-    if (bytes < b.bin.size && !enif_realloc_binary(&b.bin, bytes)) {
-        enif_release_binary(&b.bin);
+    bool ok = enif_send(NULL, &u->owner, env, msg) != 0;
+    enif_clear_env(env); /* (a failed send leaves the message) */
+    return ok;
+}
+
+static float *dec_buffer(mai_decode *d, size_t samples) {
+    mai_dec_owner *u = d->user;
+    if (!enif_alloc_binary(samples * sizeof(float), &u->bin)) return NULL;
+    u->have_bin = true;
+    return (float *)(void *)u->bin.data;
+}
+
+static void dec_release(mai_decode *d, float *buf) {
+    (void)buf;
+    mai_dec_owner *u = d->user;
+    if (u->have_bin) enif_release_binary(&u->bin);
+    u->have_bin = false;
+}
+
+static bool dec_started(mai_decode *d) {
+    ErlNifEnv *env = ((mai_dec_owner *)d->user)->env;
+    ERL_NIF_TERM k[3] = {atom(env, "rate"), atom(env, "channels"), atom(env, "frames")};
+    ERL_NIF_TERM v[3] = {enif_make_int(env, d->rate), enif_make_int(env, d->channels),
+                         d->declared_frames > 0 ? enif_make_int64(env, d->declared_frames) : atom(env, "nil")};
+    return dec_send(d, "decode_started", map_of(env, k, v, 3), true);
+}
+
+/* The chunk's binary goes to the owner as it is (the last, shorter one as
+ * a sub-binary): no copy. */
+static bool dec_chunk(mai_decode *d, float *buf, int32_t frames) {
+    (void)buf;
+    mai_dec_owner *u = d->user;
+    size_t bytes = (size_t)frames * (size_t)d->channels * sizeof(float), size = u->bin.size;
+    ERL_NIF_TERM t = enif_make_binary(u->env, &u->bin);
+    u->have_bin = false;
+    if (bytes < size) t = enif_make_sub_binary(u->env, t, 0, bytes);
+    return dec_send(d, "decoded", t, false);
+}
+
+static void dec_ended(mai_decode *d, int how, const char *reason, const char *detail) {
+    ErlNifEnv *env = ((mai_dec_owner *)d->user)->env;
+    ERL_NIF_TERM k[3], v[3];
+    unsigned n = 0;
+    k[n] = atom(env, "frames"), v[n++] = enif_make_int64(env, d->frames);
+    const char *kind = "decode_cancelled";
+    if (how == MAI_DEC_DONE) {
+        kind = "decode_done";
+        k[n] = atom(env, "rate"), v[n++] = enif_make_int(env, d->rate);
+        k[n] = atom(env, "channels"), v[n++] = enif_make_int(env, d->channels);
+    } else if (how == MAI_DEC_FAILED) {
+        kind = "decode_error";
+        k[n] = atom(env, "reason"), v[n++] = atom(env, reason);
+        k[n] = atom(env, "detail"), v[n++] = detail[0] ? string_term(env, detail) : atom(env, "nil");
+    }
+    dec_send(d, kind, map_of(env, k, v, n), true);
+}
+
+static const mai_dec_sink g_dec_sink = {dec_buffer, dec_release, dec_started, dec_chunk, dec_ended};
+
+static void *decode_main(void *arg) {
+    mai_decode *d = arg;
+    mai_dec_owner *u = d->user;
+    char detail[MAI_ERRMAX] = "";
+    const char *err = be_decode(u->path, d, detail, sizeof detail);
+    mai__dec_end(d, err, detail); /* (d is free from here) */
+    dec_owner_free(NULL, u);
+    return NULL;
+}
+
+/* decode_stream(path, owner, opts) -> {:ok, id} | {:error, :busy |
+ *   :unknown_processor | :no_memory}. opts: %{mono, chunk_frames, window,
+ *   max_ms (0: none), processor ("": the owner gets the chunks)}. The
+ *   decode runs on a thread of its own; everything else (a missing file
+ *   too) reaches the owner as messages. Dirty IO: it reads the logger
+ *   under g_lock. */
+static ERL_NIF_TERM nif_decode_stream(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    ErlNifPid owner;
+    ERL_NIF_TERM mv;
+    char mono[8], name[MAI_NAME_MAX];
+    int chunk_frames, window;
+    ErlNifSInt64 max_ms;
+    mai_dec_owner *u = calloc(1, sizeof *u);
+    if (!u) return error_atom(env, "no_memory");
+    if (!get_string(env, argv[0], u->path, sizeof u->path) || !u->path[0] || !enif_get_local_pid(env, argv[1], &owner) ||
+        !enif_is_map(env, argv[2]) || !opt_atom(env, argv[2], "mono", mono, sizeof mono) ||
+        !opt_int(env, argv[2], "chunk_frames", &chunk_frames) || !opt_int(env, argv[2], "window", &window) ||
+        !enif_get_map_value(env, argv[2], atom(env, "max_ms"), &mv) || !enif_get_int64(env, mv, &max_ms) ||
+        !opt_string(env, argv[2], "processor", name, sizeof name) || chunk_frames < 1 || window < 1 || max_ms < 0) {
+        free(u);
+        return enif_make_badarg(env);
+    }
+    mai__register_builtins();
+    mai_decode *d = mai__dec_alloc();
+    if (!d) {
+        free(u);
+        return error_atom(env, "busy");
+    }
+    d->mono = strcmp(mono, "true") == 0;
+    d->chunk_frames = chunk_frames;
+    d->window = window;
+    d->max_ms = max_ms;
+    d->sink = &g_dec_sink;
+    d->user = u;
+    if (name[0] && mai__dec_use_processor(d, name) != MAI_OK) {
+        mai__dec_discard(d);
+        free(u);
+        return error_atom(env, "unknown_processor");
+    }
+    u->owner = owner;
+    u->env = enif_alloc_env();
+    pthread_mutex_lock(&g_lock);
+    u->logger = g_logger;
+    u->have_logger = atomic_load(&g_have_logger);
+    pthread_mutex_unlock(&g_lock);
+    mai_dec_mon *m = enif_alloc_resource(g_dec_mon_type, sizeof(mai_dec_mon));
+    int32_t id = d->id;
+    m->id = id;
+    u->mon = m;
+    int mr = enif_monitor_process(env, m, &owner, &u->mref);
+    u->monitored = mr == 0;
+    pthread_attr_t attr;
+    pthread_t t;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int tr = !u->env ? -1 : pthread_create(&t, &attr, decode_main, d);
+    pthread_attr_destroy(&attr);
+    if (tr != 0) {
+        mai__dec_discard(d);
+        dec_owner_free(env, u);
         return error_atom(env, "no_memory");
     }
-    ERL_NIF_TERM k[4] = {atom(env, "rate"), atom(env, "channels"), atom(env, "frames"), atom(env, "data")};
-    ERL_NIF_TERM v[4] = {enif_make_int(env, rate), enif_make_int(env, pcm.channels),
-                         enif_make_uint64(env, (ErlNifUInt64)pcm.frames), enif_make_binary(env, &b.bin)};
-    return enif_make_tuple2(env, atom(env, "ok"), map_of(env, k, v, 4));
+    if (mr > 0) mai__dec_cancel(id); /* the owner is already gone */
+    return enif_make_tuple2(env, atom(env, "ok"), enif_make_int(env, id));
+}
+
+/* decode_ack(id, n) -> :ok | {:error, :not_running} */
+static ERL_NIF_TERM nif_decode_ack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    int id, n;
+    if (!enif_get_int(env, argv[0], &id) || !enif_get_int(env, argv[1], &n) || n < 1) return enif_make_badarg(env);
+    return mai__dec_ack(id, n) == MAI_OK ? atom(env, "ok") : error_atom(env, "not_running");
+}
+
+/* decode_cancel(id) -> :ok (a :decode_cancelled follows, and nothing else)
+ *   | {:error, :not_running} (its last message is already sent) */
+static ERL_NIF_TERM nif_decode_cancel(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    int id;
+    if (!enif_get_int(env, argv[0], &id)) return enif_make_badarg(env);
+    return mai__dec_cancel(id) == MAI_OK ? atom(env, "ok") : error_atom(env, "not_running");
 }
 
 /* set_logger(pid | nil) -> :ok */
@@ -776,6 +942,10 @@ static int nif_load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     ErlNifResourceTypeInit init = {.dtor = NULL, .stop = NULL, .down = mon_down};
     g_mon_type = enif_open_resource_type_x(env, "mai_mon", &init, ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER, NULL);
     if (!g_mon_type) return 1;
+    ErlNifResourceTypeInit dec_init = {.dtor = NULL, .stop = NULL, .down = dec_mon_down};
+    g_dec_mon_type =
+        enif_open_resource_type_x(env, "mai_dec_mon", &dec_init, ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER, NULL);
+    if (!g_dec_mon_type) return 1;
     mai__register_builtins();
     if (!g_log_env) g_log_env = enif_alloc_env();
     if (!g_thread_up) {
@@ -800,7 +970,9 @@ static ErlNifFunc nif_funcs[] = {
     {"reset_stats", 1, nif_reset_stats, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"processors", 0, nif_processors, 0},
     {"devices", 1, nif_devices, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"decode", 3, nif_decode, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"decode_stream", 3, nif_decode_stream, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"decode_ack", 2, nif_decode_ack, 0},
+    {"decode_cancel", 1, nif_decode_cancel, 0},
     {"set_logger", 1, nif_set_logger, ERL_NIF_DIRTY_JOB_IO_BOUND}, /* takes g_lock */
     {"abi_version", 0, nif_abi_version, 0},
 };

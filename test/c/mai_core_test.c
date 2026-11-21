@@ -3,11 +3,13 @@
  * callback wrapper (clock, capture/render order, counters, the input
  * meter), the mai_post ring (including a two-thread stress run), the timing
  * math (frame times, host ticks to ns, the anchor seqlock under a racing
- * writer) and the PCM buffer decoders write into. Run by
+ * writer) and the streaming decode's state machine (chunks, mono fold,
+ * length cap, back-pressure, cancel, processors). Run by
  * test/mob_audio_io_c_core_test.exs (cc on the PATH).
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #endif
@@ -408,67 +410,417 @@ static void test_anchor_two_threads(void) {
     close_stream(s);
 }
 
-/* ── PCM ───────────────────────────────────────────────────────────────── */
+/* ── Streaming decode ──────────────────────────────────────────────────── */
 
-static int grows;
+/* A sink standing in for the NIF's: records what the owner would get. A
+ * chunk's buffer stays "held" (in the owner's mailbox) until the test acks
+ * it, so `live` counts the chunk buffers in memory. The chunk/started/
+ * ended fields are written under g_dec_lock (where the sink runs) and read
+ * by the test under it too. */
+typedef struct {
+    int started, chunks, ended, how;
+    char reason[32], detail[MAI_ERRMAX];
+    int32_t rate, channels;
+    int64_t declared, ended_frames;
+    int32_t sizes[64];
+    float samples[256];
+    size_t n_samples;
+    float *held[64];
+    int n_held;
+    bool refuse;             /* started/chunk answer false: the owner is gone */
+    bool cancel_returned;    /* set by the test once mai__dec_cancel answered */
+    int chunks_after_cancel; /* must stay 0 */
+} rec;
 
-static bool host_grow(mai_pcm *p, size_t bytes) {
-    float *d = realloc(p->data, bytes);
-    if (!d) return false;
-    p->data = d;
-    p->cap = bytes;
-    grows++;
+static _Atomic int live, live_max;
+
+static float *rec_buffer(mai_decode *d, size_t samples) {
+    (void)d;
+    int n = atomic_fetch_add(&live, 1) + 1;
+    for (int m = atomic_load(&live_max); n > m && !atomic_compare_exchange_weak(&live_max, &m, n);)
+        ;
+    return malloc(samples * sizeof(float));
+}
+
+static void rec_free(float *buf) {
+    free(buf);
+    atomic_fetch_sub(&live, 1);
+}
+
+static void rec_release(mai_decode *d, float *buf) {
+    (void)d;
+    rec_free(buf);
+}
+
+static bool rec_started(mai_decode *d) {
+    rec *r = d->user;
+    r->started++;
+    r->rate = d->rate;
+    r->channels = d->channels;
+    r->declared = d->declared_frames;
+    return !r->refuse;
+}
+
+static bool rec_chunk(mai_decode *d, float *buf, int32_t frames) {
+    rec *r = d->user;
+    if (r->cancel_returned) r->chunks_after_cancel++;
+    if (r->chunks < 64) r->sizes[r->chunks] = frames;
+    r->chunks++;
+    for (int32_t i = 0; i < frames * d->channels && r->n_samples < 256; i++) r->samples[r->n_samples++] = buf[i];
+    if (r->refuse || r->n_held == 64) {
+        rec_free(buf);
+        return !r->refuse;
+    }
+    r->held[r->n_held++] = buf;
     return true;
 }
 
-static bool failing_grow(mai_pcm *p, size_t bytes) {
-    (void)p; (void)bytes;
-    return false;
+static void rec_ended(mai_decode *d, int how, const char *reason, const char *detail) {
+    rec *r = d->user;
+    r->ended++;
+    r->how = how;
+    snprintf(r->reason, sizeof r->reason, "%s", reason ? reason : "");
+    snprintf(r->detail, sizeof r->detail, "%s", detail);
+    r->ended_frames = d->frames;
 }
 
-static void test_pcm(void) {
-    /* stereo floats, grown by doubling */
-    mai_pcm p = {.max_bytes = 1 << 20, .grow = host_grow};
-    float st[2 * 1000];
-    for (int i = 0; i < 2 * 1000; i++) st[i] = (float)i;
-    grows = 0;
-    for (int k = 0; k < 20; k++) CHECK(mai__pcm_push_f32(&p, st, 1000, 2) == MAI_PCM_OK);
-    CHECK(p.frames == 20000 && p.channels == 2);
-    CHECK(grows <= 4); /* 64 KiB doubling to 160 KB */
-    CHECK(p.data[0] == 0.0f && p.data[2 * 19000 + 1999] == 1999.0f);
-    /* a channel count that changes mid-file */
-    CHECK(mai__pcm_push_f32(&p, st, 10, 1) == MAI_PCM_CHANNELS);
-    free(p.data);
+static const mai_dec_sink REC = {rec_buffer, rec_release, rec_started, rec_chunk, rec_ended};
 
-    /* mono folding from 16-bit stereo */
-    mai_pcm m = {.max_bytes = 1 << 20, .mono = true, .grow = host_grow};
-    int16_t s16[4] = {16384, -16384, 32767, 32767};
-    CHECK(mai__pcm_push_s16(&m, s16, 2, 2) == MAI_PCM_OK);
-    CHECK(m.channels == 1 && m.frames == 2);
-    CHECK(m.data[0] == 0.0f && fabsf(m.data[1] - 32767 / 32768.0f) < 1e-6f);
-    /* mono accepts any source channel count */
-    CHECK(mai__pcm_push_s16(&m, s16, 1, 4) == MAI_PCM_OK && m.frames == 3);
-    free(m.data);
+/* The owner is done with (up to `max` of) the chunks it holds, oldest
+ * first: free them, then ack. */
+static void owner_ack(rec *r, int32_t id, int max) {
+    pthread_mutex_lock(&g_dec_lock);
+    int n = r->n_held < max ? r->n_held : max;
+    for (int i = 0; i < n; i++) rec_free(r->held[i]);
+    memmove(r->held, r->held + n, sizeof(float *) * (size_t)(r->n_held - n));
+    r->n_held -= n;
+    pthread_mutex_unlock(&g_dec_lock);
+    if (n) mai__dec_ack(id, n);
+}
 
-    /* 16-bit stereo kept stereo */
-    mai_pcm k = {.max_bytes = 1 << 20, .grow = host_grow};
-    CHECK(mai__pcm_push_s16(&k, s16, 2, 2) == MAI_PCM_OK);
-    CHECK(k.data[0] == 0.5f && k.data[1] == -0.5f);
-    free(k.data);
+static void owner_ack_all(rec *r, int32_t id) { owner_ack(r, id, 64); }
 
-    /* the cap: exactly max_bytes fits, one frame more doesn't; a cap
-     * under the first allocation is honoured */
-    mai_pcm c = {.max_bytes = 400, .grow = host_grow};
-    float mono[100] = {0};
-    CHECK(mai__pcm_push_f32(&c, mono, 100, 1) == MAI_PCM_OK);
-    CHECK(c.cap == 400);
-    CHECK(mai__pcm_push_f32(&c, mono, 1, 1) == MAI_PCM_TOO_LARGE);
-    CHECK(c.frames == 100);
-    free(c.data);
+static mai_decode *new_decode(rec *r, bool mono, int32_t chunk_frames, int32_t window, int64_t max_ms) {
+    memset(r, 0, sizeof *r);
+    mai_decode *d = mai__dec_alloc();
+    if (!d) return NULL;
+    d->mono = mono;
+    d->chunk_frames = chunk_frames;
+    d->window = window;
+    d->max_ms = max_ms;
+    d->sink = &REC;
+    d->user = r;
+    return d;
+}
 
-    /* the allocator saying no */
-    mai_pcm f = {.max_bytes = 1 << 20, .grow = failing_grow};
-    CHECK(mai__pcm_push_f32(&f, mono, 10, 1) == MAI_PCM_NO_MEMORY);
+static void test_decode_chunks(void) {
+    rec r;
+    /* 16-bit stereo folded to mono, in chunks of 4 frames: 4, 4, then the rest at the end */
+    mai_decode *d = new_decode(&r, true, 4, 100, 0);
+    int32_t id = d->id;
+    CHECK(mai__dec_begin(d, 44100, 2, 10) == MAI_DEC_GO);
+    CHECK(r.started == 1 && r.rate == 44100 && r.channels == 1 && r.declared == 10);
+    int16_t s16[20];
+    for (int i = 0; i < 10; i++) {
+        s16[2 * i] = (int16_t)(i * 1000);
+        s16[2 * i + 1] = (int16_t)(i * 3000);
+    }
+    CHECK(mai__dec_push_s16(d, s16, 10, 2) == MAI_DEC_GO);
+    CHECK(r.chunks == 2 && r.sizes[0] == 4 && r.sizes[1] == 4);
+    mai__dec_end(d, NULL, NULL);
+    CHECK(r.chunks == 3 && r.sizes[2] == 2 && r.ended == 1 && r.how == MAI_DEC_DONE && r.ended_frames == 10);
+    CHECK(r.n_samples == 10);
+    for (int i = 0; i < 10 && i < (int)r.n_samples; i++) CHECK(fabsf(r.samples[i] - i * 2000 / 32768.0f) < 1e-6f);
+    /* the slot is free: its id is unknown, no chunk buffer leaked */
+    CHECK(mai__dec_cancel(id) == MAI_ERR_NOT_OPEN && mai__dec_ack(id, 1) == MAI_ERR_NOT_OPEN);
+    owner_ack_all(&r, id);
+    CHECK(atomic_load(&live) == 0);
+
+    /* float stereo kept stereo; chunks of 3 frames across pushes; a stated length of 0 is unknown */
+    d = new_decode(&r, false, 3, 100, 0);
+    CHECK(mai__dec_begin(d, 48000, 2, 0) == MAI_DEC_GO && r.channels == 2 && r.declared == -1);
+    float st[14];
+    for (int i = 0; i < 14; i++) st[i] = (float)i;
+    CHECK(mai__dec_push_f32(d, st, 2, 2) == MAI_DEC_GO && r.chunks == 0);
+    CHECK(mai__dec_push_f32(d, st + 4, 5, 2) == MAI_DEC_GO && r.chunks == 2);
+    id = d->id;
+    mai__dec_end(d, NULL, NULL);
+    CHECK(r.chunks == 3 && r.sizes[0] == 3 && r.sizes[1] == 3 && r.sizes[2] == 1 && r.how == MAI_DEC_DONE);
+    CHECK(r.n_samples == 14);
+    for (int i = 0; i < 14 && i < (int)r.n_samples; i++) CHECK(r.samples[i] == (float)i);
+    owner_ack_all(&r, id);
+    CHECK(atomic_load(&live) == 0);
+}
+
+static void test_decode_errors(void) {
+    rec r;
+    float x[8] = {0};
+
+    /* the channel count changes mid-file; begin twice; no format */
+    mai_decode *d = new_decode(&r, false, 4, 100, 0);
+    CHECK(mai__dec_push_f32(d, x, 1, 1) == MAI_DEC_FORMAT); /* before begin */
+    CHECK(mai__dec_begin(d, 0, 1, -1) == MAI_DEC_FORMAT && r.started == 0);
+    CHECK(mai__dec_begin(d, 8000, 1, -1) == MAI_DEC_GO);
+    CHECK(mai__dec_begin(d, 8000, 1, -1) == MAI_DEC_FORMAT);
+    int dr = mai__dec_push_f32(d, x, 2, 2);
+    CHECK(dr == MAI_DEC_FORMAT);
+    char detail[MAI_ERRMAX] = "";
+    const char *why = mai__dec_reason(dr, detail, sizeof detail);
+    int32_t id = d->id;
+    mai__dec_end(d, why, detail);
+    CHECK(r.how == MAI_DEC_FAILED && strcmp(r.reason, "decode_error") == 0 && strstr(r.detail, "mid-file") != NULL);
+    owner_ack_all(&r, id);
+
+    /* nothing decoded: no_audio, whether or not the format came */
+    d = new_decode(&r, false, 4, 100, 0);
+    mai__dec_end(d, NULL, NULL);
+    CHECK(r.how == MAI_DEC_FAILED && strcmp(r.reason, "no_audio") == 0 && r.started == 0);
+    d = new_decode(&r, false, 4, 100, 0);
+    CHECK(mai__dec_begin(d, 8000, 1, -1) == MAI_DEC_GO);
+    mai__dec_end(d, NULL, NULL);
+    CHECK(r.how == MAI_DEC_FAILED && strcmp(r.reason, "no_audio") == 0 && r.started == 1);
+
+    /* max_ms: a stated length past it fails at once (after the format went
+     * out); decoded frames past it fail at the push that crosses it */
+    d = new_decode(&r, false, 4, 100, 1000);
+    CHECK(mai__dec_begin(d, 100, 1, 101) == MAI_DEC_TOO_LONG && r.started == 1);
+    mai__dec_end(d, mai__dec_reason(MAI_DEC_TOO_LONG, NULL, 0), "");
+    CHECK(r.how == MAI_DEC_FAILED && strcmp(r.reason, "too_long") == 0);
+    d = new_decode(&r, false, 4, 100, 1000);
+    id = d->id;
+    CHECK(mai__dec_begin(d, 100, 1, 100) == MAI_DEC_GO);
+    float hundred[100] = {0};
+    CHECK(mai__dec_push_f32(d, hundred, 100, 1) == MAI_DEC_GO);
+    CHECK(mai__dec_push_f32(d, x, 1, 1) == MAI_DEC_TOO_LONG);
+    mai__dec_end(d, "too_long", "");
+    CHECK(r.how == MAI_DEC_FAILED && r.ended_frames == 100 && r.chunks == 25);
+    owner_ack_all(&r, id);
+
+    /* the owner is gone (the send fails): the decode stops as cancelled */
+    d = new_decode(&r, false, 4, 100, 0);
+    r.refuse = true;
+    CHECK(mai__dec_begin(d, 8000, 1, -1) == MAI_DEC_STOP);
+    mai__dec_end(d, mai__dec_reason(MAI_DEC_STOP, NULL, 0), "");
+    CHECK(r.how == MAI_DEC_CANCELLED);
+    d = new_decode(&r, false, 4, 100, 0);
+    CHECK(mai__dec_begin(d, 8000, 1, -1) == MAI_DEC_GO);
+    r.refuse = true;
+    CHECK(mai__dec_push_f32(d, x, 8, 1) == MAI_DEC_STOP && r.chunks == 1);
+    mai__dec_end(d, "cancelled", "");
+    CHECK(r.how == MAI_DEC_CANCELLED);
+    CHECK(atomic_load(&live) == 0);
+}
+
+static void test_decode_slots(void) {
+    rec r[MAI_MAX_DECODES];
+    mai_decode *d[MAI_MAX_DECODES];
+    mai_stream *s = open_stream("mai_silence", MAI_DIR_OUT, 48000, 2, 1);
+    for (int i = 0; i < MAI_MAX_DECODES; i++) {
+        d[i] = new_decode(&r[i], false, 4, 1, 0);
+        CHECK(d[i] && d[i]->id > 0 && d[i]->id != s->id);
+        for (int j = 0; j < i; j++) CHECK(d[i] && d[j] && d[i]->id != d[j]->id);
+    }
+    rec extra;
+    CHECK(new_decode(&extra, false, 4, 1, 0) == NULL); /* MAI_MAX_DECODES run */
+    /* a decode id never reaches a stream, nor a stream id a decode */
+    CHECK(mai_post(d[0]->id, "x", 1) == MAI_ERR_NOT_OPEN);
+    CHECK(mai__dec_cancel(s->id) == MAI_ERR_NOT_OPEN && mai__dec_ack(0, 1) == MAI_ERR_NOT_OPEN);
+    CHECK(mai__dec_ack(d[0]->id, 0) == MAI_ERR_INVALID);
+    int32_t old = d[0]->id;
+    mai__dec_discard(d[0]);
+    CHECK(mai__dec_cancel(old) == MAI_ERR_NOT_OPEN);
+    mai_decode *again = new_decode(&extra, false, 4, 1, 0);
+    CHECK(again == d[0] && again->id != old); /* the slot, with a new id */
+    mai__dec_discard(again);
+    for (int i = 1; i < MAI_MAX_DECODES; i++) mai__dec_discard(d[i]);
+    close_stream(s);
+}
+
+/* A cancel that comes before the end wins over it: the owner gets the
+ * cancelled end, and the chunk still being filled isn't sent. */
+static void test_decode_cancel_wins(void) {
+    rec r;
+    mai_decode *d = new_decode(&r, false, 4, 100, 0);
+    int32_t id = d->id;
+    float x[6] = {0};
+    CHECK(mai__dec_begin(d, 8000, 1, -1) == MAI_DEC_GO);
+    CHECK(mai__dec_push_f32(d, x, 6, 1) == MAI_DEC_GO && r.chunks == 1);
+    CHECK(mai__dec_cancel(id) == MAI_OK);
+    CHECK(mai__dec_stopping(d));
+    CHECK(mai__dec_push_f32(d, x, 1, 1) == MAI_DEC_STOP);
+    mai__dec_end(d, NULL, NULL);
+    CHECK(r.how == MAI_DEC_CANCELLED && r.chunks == 1 && r.ended == 1);
+    CHECK(mai__dec_cancel(id) == MAI_ERR_NOT_OPEN);
+    owner_ack_all(&r, id);
+    CHECK(atomic_load(&live) == 0);
+}
+
+/* A worker thread feeding codec buffers of 1024 frames until a push stops it. */
+typedef struct {
+    mai_decode *d;
+    int64_t limit;            /* frames to push; 0: until stopped */
+    _Atomic int64_t ended_ns; /* when mai__dec_end returned */
+} worker;
+
+static void *decode_worker(void *arg) {
+    worker *w = arg;
+    float buf[1024 * 2];
+    for (int i = 0; i < 1024 * 2; i++) buf[i] = 0.25f;
+    int r = mai__dec_begin(w->d, 48000, 2, -1);
+    for (int64_t pushed = 0; r == MAI_DEC_GO && (w->limit == 0 || pushed < w->limit); pushed += 1024)
+        r = mai__dec_push_f32(w->d, buf, 1024, 2);
+    mai__dec_end(w->d, r == MAI_DEC_GO ? NULL : mai__dec_reason(r, NULL, 0), "");
+    atomic_store(&w->ended_ns, mai_now_ns());
+    return NULL;
+}
+
+static int read_locked(const int *v) {
+    pthread_mutex_lock(&g_dec_lock);
+    int x = *v;
+    pthread_mutex_unlock(&g_dec_lock);
+    return x;
+}
+
+static void cancel_marking(rec *r, int32_t id) {
+    CHECK(mai__dec_cancel(id) == MAI_OK);
+    pthread_mutex_lock(&g_dec_lock);
+    r->cancel_returned = true;
+    pthread_mutex_unlock(&g_dec_lock);
+}
+
+/* Back-pressure: with nobody acking, the worker sends `window` chunks and
+ * waits; each ack lets one more go; the chunk buffers in memory never pass
+ * window + 1 (those held, the one being filled). A cancel while it waits
+ * ends it at once, and nothing reaches the owner after the cancel. */
+static void test_decode_backpressure(void) {
+    rec r;
+    atomic_store(&live_max, 0);
+    mai_decode *d = new_decode(&r, false, 256, 3, 0);
+    int32_t id = d->id;
+    worker w = {d, 0, 0};
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, decode_worker, &w) == 0);
+    usleep(50000);
+    CHECK(read_locked(&r.chunks) == 3 && atomic_load(&w.ended_ns) == 0);
+    owner_ack(&r, id, 1);
+    for (int i = 0; i < 1000 && read_locked(&r.chunks) < 4; i++) usleep(1000);
+    usleep(20000);
+    CHECK(read_locked(&r.chunks) == 4);
+    /* acking everything as it comes: many more chunks, the bound holds */
+    for (int i = 0; i < 200; i++) {
+        owner_ack_all(&r, id);
+        usleep(100);
+    }
+    CHECK(read_locked(&r.chunks) > 10);
+    CHECK(atomic_load(&live_max) <= 3 + 1);
+    usleep(20000); /* blocked again: nobody acks */
+    int64_t t0 = mai_now_ns();
+    cancel_marking(&r, id);
+    pthread_join(t, NULL);
+    int64_t latency_ns = atomic_load(&w.ended_ns) - t0;
+    printf("decode cancel while waiting for an ack: ended %.3f ms after the cancel; at most %d chunk buffers live\n",
+           latency_ns / 1e6, atomic_load(&live_max));
+    CHECK(latency_ns < 50000000LL);
+    CHECK(r.how == MAI_DEC_CANCELLED && r.chunks_after_cancel == 0);
+    owner_ack_all(&r, id);
+    CHECK(atomic_load(&live) == 0);
+}
+
+/* A cancel while the worker is busy pushing (the owner acks at once): it
+ * stops at its next push, and no chunk reaches the owner after the cancel. */
+static void test_decode_cancel_running(void) {
+    rec r;
+    mai_decode *d = new_decode(&r, true, 512, 1000000, 0);
+    int32_t id = d->id;
+    worker w = {d, 0, 0};
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, decode_worker, &w) == 0);
+    for (int i = 0; i < 20; i++) {
+        owner_ack_all(&r, id);
+        usleep(1000);
+    }
+    int64_t t0 = mai_now_ns();
+    cancel_marking(&r, id);
+    pthread_join(t, NULL);
+    int64_t latency_ns = atomic_load(&w.ended_ns) - t0;
+    printf("decode cancel while decoding: ended %.3f ms after the cancel, %d chunks before it\n", latency_ns / 1e6,
+           read_locked(&r.chunks));
+    CHECK(latency_ns < 50000000LL);
+    CHECK(r.how == MAI_DEC_CANCELLED && r.chunks > 0 && r.chunks_after_cancel == 0);
+    owner_ack_all(&r, id);
+    CHECK(atomic_load(&live) == 0);
+}
+
+/* A decode into a processor: STARTED, captures on the decode's thread with
+ * the file's clock, STOPPED (after a cancel too); the processor is pinned
+ * meanwhile; the owner gets the format and the end, no chunks. */
+typedef struct {
+    int events[4], n_events;
+    int32_t event_stream;
+    int64_t stop_frame;
+    int captures;
+    int64_t frames_seen, next_frame;
+    bool clock_ok;
+    int32_t rate, channels;
+} dec_probe;
+
+static void dec_probe_capture(void *ctx, const float *in, int32_t frames, const mai_time *t) {
+    dec_probe *p = ctx;
+    (void)in;
+    if (t->frame != p->next_frame || t->rate != p->rate || t->channels != p->channels) p->clock_ok = false;
+    p->next_frame = t->frame + frames;
+    p->frames_seen += frames;
+    p->captures++;
+}
+
+static void dec_probe_event(void *ctx, int32_t stream, int32_t event, const mai_time *t) {
+    dec_probe *p = ctx;
+    if (p->n_events < 4) p->events[p->n_events++] = event;
+    p->event_stream = stream;
+    if (event == MAI_EVENT_STARTED) {
+        p->rate = t->rate;
+        p->channels = t->channels;
+        p->clock_ok = t->frame == 0;
+    }
+    if (event == MAI_EVENT_STOPPED) p->stop_frame = t->frame;
+}
+
+static void test_decode_processor(void) {
+    static const mai_processor P = {NULL, dec_probe_capture, dec_probe_event};
+    dec_probe p;
+    memset(&p, 0, sizeof p);
+    CHECK(mai_register("dec_probe", &P, &p) == MAI_OK);
+    rec r;
+    mai_decode *d = new_decode(&r, true, 100, 1, 0);
+    CHECK(mai__dec_use_processor(d, "nope") == MAI_ERR_NOT_FOUND);
+    CHECK(mai__dec_use_processor(d, "dec_probe") == MAI_OK);
+    CHECK(mai_unregister("dec_probe") == MAI_ERR_BUSY);
+    int32_t id = d->id;
+    CHECK(mai__dec_begin(d, 22050, 2, 1000) == MAI_DEC_GO);
+    CHECK(p.n_events == 1 && p.events[0] == MAI_EVENT_STARTED && p.event_stream == id);
+    CHECK(p.rate == 22050 && p.channels == 1 && r.started == 1);
+    int16_t s16[2 * 250] = {0};
+    /* window 1 and no acks: a processor takes chunks without them */
+    CHECK(mai__dec_push_s16(d, s16, 250, 2) == MAI_DEC_GO && p.captures == 2);
+    mai__dec_end(d, NULL, NULL);
+    CHECK(p.captures == 3 && p.frames_seen == 250 && p.clock_ok);
+    CHECK(p.n_events == 2 && p.events[1] == MAI_EVENT_STOPPED && p.stop_frame == 250);
+    CHECK(r.chunks == 0 && r.how == MAI_DEC_DONE && r.ended_frames == 250);
+    CHECK(atomic_load(&live) == 0);
+
+    /* cancelled: the next push stops, STOPPED still comes */
+    memset(&p, 0, sizeof p);
+    d = new_decode(&r, false, 100, 1, 0);
+    CHECK(mai__dec_use_processor(d, "dec_probe") == MAI_OK);
+    id = d->id;
+    CHECK(mai__dec_begin(d, 8000, 1, -1) == MAI_DEC_GO);
+    CHECK(mai__dec_cancel(id) == MAI_OK);
+    float x[100] = {0};
+    int dr = mai__dec_push_f32(d, x, 100, 1);
+    CHECK(dr == MAI_DEC_STOP && p.captures == 0);
+    mai__dec_end(d, mai__dec_reason(dr, NULL, 0), "");
+    CHECK(p.n_events == 2 && p.events[1] == MAI_EVENT_STOPPED && r.how == MAI_DEC_CANCELLED);
+    CHECK(mai_unregister("dec_probe") == MAI_OK);
 }
 
 int main(void) {
@@ -482,7 +834,13 @@ int main(void) {
     test_timing_math();
     test_anchor();
     test_anchor_two_threads();
-    test_pcm();
+    test_decode_chunks();
+    test_decode_errors();
+    test_decode_slots();
+    test_decode_cancel_wins();
+    test_decode_backpressure();
+    test_decode_cancel_running();
+    test_decode_processor();
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

@@ -9,7 +9,7 @@
  *              which buses run, the client formats, the callbacks.
  *   session    which AVAudioSession configuration the open streams need
  *              (mob_audio_io_nif.m applies it).
- *   decode     ExtAudioFile into a mai_pcm.
+ *   decode     ExtAudioFile, read in chunks into a streaming decode.
  *
  * mob_audio_io_nif.m includes it after ../common/mai_nif.c; the host test
  * after ../common/mai_core.c.
@@ -332,16 +332,13 @@ static bool mai_apple_session_eq(const mai_apple_session *a, const mai_apple_ses
 
 /* ── Decode ────────────────────────────────────────────────────────────── */
 
-#define MAI_APPLE_DECODE_CHUNK 4096 /* frames per ExtAudioFileRead */
-
-static const char *mai_apple_pcm_error(int r) {
-    return r == MAI_PCM_TOO_LARGE ? "too_large" : r == MAI_PCM_NO_MEMORY ? "no_memory" : "decode_error";
-}
+#define MAI_APPLE_DECODE_CHUNK 4096 /* frames per ExtAudioFileRead: the most a cancel waits for */
 
 /* `path` (any file ExtAudioFile reads: WAV, AIFF, CAF, MP3, AAC/M4A, ALAC,
- * FLAC) into `pcm` as float32 interleaved, at the file's rate and channel
- * count. NULL or an error atom, with the OSStatus in `detail`. */
-static const char *mai_apple_decode(const char *path, mai_pcm *pcm, int32_t *rate, char *detail, size_t detail_n) {
+ * FLAC) into the decode `d` as float32 interleaved, at the file's rate and
+ * channel count, checking the cancel flag before every read. NULL at the
+ * end of the file or an error atom, with the OSStatus in `detail`. */
+static const char *mai_apple_decode(const char *path, mai_decode *d, char *detail, size_t detail_n) {
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
         snprintf(detail, detail_n, "no such file: %s", path);
@@ -376,21 +373,20 @@ static const char *mai_apple_decode(const char *path, mai_pcm *pcm, int32_t *rat
         err = "unsupported";
         goto done;
     }
-    /* fail fast when the file's length says it won't fit */
     SInt64 length = 0;
     size = sizeof length;
-    if (ExtAudioFileGetProperty(f, kExtAudioFileProperty_FileLengthFrames, &size, &length) == noErr && length > 0 &&
-        (uint64_t)length * (uint64_t)(pcm->mono ? 1 : ch) * sizeof(float) > pcm->max_bytes) {
-        snprintf(detail, detail_n, "%lld frames of %d channels", (long long)length, (int)ch);
-        err = "too_large";
-        goto done;
-    }
+    if (ExtAudioFileGetProperty(f, kExtAudioFileProperty_FileLengthFrames, &size, &length) != noErr) length = -1;
     chunk = malloc((size_t)MAI_APPLE_DECODE_CHUNK * (size_t)ch * sizeof(float));
     if (!chunk) {
         err = "no_memory";
         goto done;
     }
-    for (;;) {
+    int dr = mai__dec_begin(d, (int32_t)lround(file_fmt.mSampleRate), ch, (int64_t)length);
+    while (dr == MAI_DEC_GO) {
+        if (mai__dec_stopping(d)) {
+            dr = MAI_DEC_STOP;
+            break;
+        }
         AudioBufferList abl;
         abl.mNumberBuffers = 1;
         abl.mBuffers[0].mNumberChannels = (UInt32)ch;
@@ -403,13 +399,9 @@ static const char *mai_apple_decode(const char *path, mai_pcm *pcm, int32_t *rat
             goto done;
         }
         if (frames == 0) break;
-        int pr = mai__pcm_push_f32(pcm, chunk, frames, ch);
-        if (pr != MAI_PCM_OK) {
-            err = mai_apple_pcm_error(pr);
-            goto done;
-        }
+        dr = mai__dec_push_f32(d, chunk, frames, ch);
     }
-    *rate = (int32_t)lround(file_fmt.mSampleRate);
+    if (dr != MAI_DEC_GO) err = mai__dec_reason(dr, detail, detail_n);
 done:
     free(chunk);
     ExtAudioFileDispose(f);
