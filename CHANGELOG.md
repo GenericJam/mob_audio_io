@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.1.0)
+## 0.1.0
 
 - C ABI `priv/include/mob_audio_io.h` (ABI 1): `mai_register`,
   `mai_unregister`, `mai_post`, `mai_abi_version`, `mai_now_ns`;
