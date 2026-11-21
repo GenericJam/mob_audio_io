@@ -25,16 +25,27 @@
   from 0.5 s to 8 s.
 - iOS: an interruption that began while the app was suspended, or whose end
   never came, is recovered when the app returns to the foreground.
-- `MobAudioIo.devices/1`, `MobAudioIo.decode/2`; the Fake decodes WAV.
+- `MobAudioIo.devices/1`.
+- `MobAudioIo.decode_stream/3`: a file decoded on a thread of its own and
+  handed out in chunks as it decodes, to the owner (`{:mob_audio_io,
+  :decoded, id, binary}`, at most `window:` chunks unacknowledged:
+  `decode_ack/2`) or to a registered processor's `capture` on the decode's
+  thread (`processor:`), with `:decode_started` and one end
+  (`:decode_done`, `:decode_cancelled`, `:decode_error`); `mono:`,
+  `chunk_frames:`, `max_ms:` (`:too_long`, at once from the file's stated
+  length). `decode_cancel/1` stops it within one codec buffer and releases
+  the codec; the owner's exit cancels it. `decode/2` collects one; the Fake
+  runs both on WAV. CI decodes 5-minute WAV, M4A and MP3 files in chunks on
+  macOS (memory bounded, cancel mid-file), through the real NIF too.
 - `MobAudioIo.SelfTest` checks output and, when the microphone is
   permitted, input.
 * Android: AAudio input with presets (default, generic, performance,
   unprocessed, voice) and device selection, duplex (input read as 16-bit in
   the output callback through a ring), `RECORD_AUDIO` check, `devices/1`
-  through `AudioManager`, `decode/2` through `AMediaCodec`.
+  through `AudioManager`, file decoding through `AMediaCodec`.
 * iOS: RemoteIO input (VoiceProcessingIO for `:voice`), duplex in one unit,
   the session configured from all open streams, preferred input by port UID,
-  microphone permission check, `devices/1`, `decode/2` through ExtAudioFile.
+  microphone permission check, `devices/1`, file decoding through ExtAudioFile.
 * A stream lost within 1 s of each start backs off (0.5 s to 8 s) instead
   of reopening at once; an explicit Android device that disappears falls
   back to the system's route on reopen.

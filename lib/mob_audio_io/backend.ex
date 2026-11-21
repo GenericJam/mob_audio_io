@@ -9,6 +9,12 @@ defmodule MobAudioIo.Backend do
   2, sharing: :shared | :exclusive, session: :play | :mix |
   :play_and_record, preset: MobAudioIo.preset(), device: String.t() ("":
   the default), input_device: String.t()}`.
+
+  `decode_opts` is `MobAudioIo`'s normalized decode options: `%{mono:
+  boolean(), chunk_frames: pos_integer(), window: pos_integer(), max_ms:
+  non_neg_integer() (0: no limit), processor: String.t() ("": the owner
+  gets the chunks), module: module() | nil}`. A decode sends its owner the
+  messages `MobAudioIo`'s "Decoding files" describes.
   """
 
   @callback open(owner :: pid(), MobAudioIo.direction(), opts :: map()) ::
@@ -19,6 +25,9 @@ defmodule MobAudioIo.Backend do
   @callback reset_stats(MobAudioIo.stream()) :: :ok | {:error, :not_open | :unsupported}
   @callback processors() :: [String.t()] | {:error, :unsupported}
   @callback devices(:input | :output) :: [map()] | {:error, term()}
-  @callback decode(path :: String.t(), max_bytes :: pos_integer(), mono :: boolean()) ::
-              {:ok, map()} | {:error, term()}
+  @callback decode_stream(path :: String.t(), owner :: pid(), decode_opts :: map()) ::
+              {:ok, MobAudioIo.decode()} | {:error, term()}
+  @callback decode_ack(MobAudioIo.decode(), pos_integer()) ::
+              :ok | {:error, :not_running | :unsupported}
+  @callback decode_cancel(MobAudioIo.decode()) :: :ok | {:error, :not_running | :unsupported}
 end

@@ -45,8 +45,18 @@ defmodule MobAudioIo.Native do
   def devices(direction), do: native(fn -> :mob_audio_io_nif.devices(direction) end)
 
   @impl true
-  def decode(path, max_bytes, mono),
-    do: native(fn -> :mob_audio_io_nif.decode(path, max_bytes, mono) end)
+  def decode_stream(path, owner, opts) do
+    native(fn ->
+      MobAudioIo.Log.attach()
+      :mob_audio_io_nif.decode_stream(path, owner, Map.delete(opts, :module))
+    end)
+  end
+
+  @impl true
+  def decode_ack(decode, n), do: native(fn -> :mob_audio_io_nif.decode_ack(decode, n) end)
+
+  @impl true
+  def decode_cancel(decode), do: native(fn -> :mob_audio_io_nif.decode_cancel(decode) end)
 
   @doc "Whether the NIF is linked into this build."
   @spec available?() :: boolean()

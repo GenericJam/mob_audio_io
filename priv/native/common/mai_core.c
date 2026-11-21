@@ -19,7 +19,9 @@
  *              block's presentation time.
  *   posts      per stream, a single-producer single-consumer ring the audio
  *              thread writes (mai_post) and the event thread drains.
- *   pcm        the growing, capped buffer a file decode writes floats into.
+ *   decode     a file decode's chunking, mono fold, length cap, cancel flag
+ *              and back-pressure (the owner acknowledges chunks), between
+ *              the platform decoder and the decode's sink or processor.
  *
  * mai_nif.c includes this file; the platform files include mai_nif.c.
  */
@@ -29,6 +31,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -144,7 +147,16 @@ typedef struct mai_stream {
 static pthread_mutex_t g_reg_lock = PTHREAD_MUTEX_INITIALIZER;
 static mai_entry g_reg[MAI_MAX_PROCESSORS];
 static mai_stream g_streams[MAI_MAX_STREAMS];
-static uint32_t g_next_gen = 1;
+static _Atomic uint32_t g_next_gen = 1;
+
+/* A fresh, nonzero 28-bit generation. Streams and decodes both take theirs
+ * from here, so a decode's id is never a stream's. */
+static uint32_t mai__next_gen(void) {
+    uint32_t g;
+    do g = atomic_fetch_add(&g_next_gen, 1) & 0x0fffffffu;
+    while (g == 0);
+    return g;
+}
 
 /* ── Clock ─────────────────────────────────────────────────────────────── */
 
@@ -215,26 +227,32 @@ int32_t mai_unregister(const char *name) {
     return r;
 }
 
-/* Pin `name` for a stream: copies of its processor and ctx into `s`. */
-static int32_t mai__acquire(mai_stream *s, const char *name) {
+/* Pin `name`: copies of its processor and ctx; its entry's refs count the
+ * pins (mai_register and mai_unregister answer MAI_ERR_BUSY meanwhile). */
+static int32_t mai__pin(const char *name, mai_entry **entry, mai_processor *p, void **ctx) {
     pthread_mutex_lock(&g_reg_lock);
     mai_entry *e = mai__name_ok(name) ? mai__find_locked(name) : NULL;
     if (e) {
         e->refs++;
-        s->entry = e;
-        s->p = e->p;
-        s->ctx = e->ctx;
+        *entry = e;
+        *p = e->p;
+        *ctx = e->ctx;
     }
     pthread_mutex_unlock(&g_reg_lock);
     return e ? MAI_OK : MAI_ERR_NOT_FOUND;
 }
 
-static void mai__release(mai_stream *s) {
+static void mai__unpin(mai_entry **entry) {
     pthread_mutex_lock(&g_reg_lock);
-    if (s->entry) s->entry->refs--;
-    s->entry = NULL;
+    if (*entry) (*entry)->refs--;
+    *entry = NULL;
     pthread_mutex_unlock(&g_reg_lock);
 }
+
+/* Pin `name` for a stream. */
+static int32_t mai__acquire(mai_stream *s, const char *name) { return mai__pin(name, &s->entry, &s->p, &s->ctx); }
+
+static void mai__release(mai_stream *s) { mai__unpin(&s->entry); }
 
 /* Names of the registered processors into `names` (up to `max`); the count. */
 static int mai__processor_names(char names[][MAI_NAME_MAX], int max) {
@@ -290,8 +308,7 @@ static mai_stream *mai__alloc_stream(void) {
         mai_stream *s = &g_streams[i];
         if (atomic_load(&s->open)) continue;
         memset(s, 0, sizeof *s);
-        s->gen = g_next_gen++ & 0x0fffffffu;
-        if (s->gen == 0) s->gen = g_next_gen++;
+        s->gen = mai__next_gen();
         s->id = (int32_t)((s->gen << MAI_SLOT_BITS) | (uint32_t)i);
         s->last_sample_time = -1;
         atomic_store(&s->cb_frames_min, UINT32_MAX);
@@ -496,75 +513,320 @@ static bool mai__pop_post(mai_stream *s, mai_msg *out) {
     return true;
 }
 
-/* ── PCM (file decoding) ───────────────────────────────────────────────── */
+/* ── Streaming decode ──────────────────────────────────────────────────── */
 
-/* Interleaved floats a decoder appends to, grown by `grow` (which sets
- * `data` and `cap` to at least `bytes`, or answers false) and capped at
- * `max_bytes`. `mono` folds every source frame to one channel. */
-typedef struct mai_pcm {
-    float *data;
-    size_t cap;    /* bytes */
-    size_t frames; /* frames written */
-    size_t max_bytes;
-    int32_t channels; /* of `data`: 1 when mono, else the source's; 0 until the first push */
+/* A file decode runs on a thread of its own (mai_nif.c decode_main). The
+ * platform decoder (be_decode) calls mai__dec_begin once it knows the
+ * format, then pushes each codec buffer's frames; the core folds them to
+ * mono if asked and cuts them into chunks of chunk_frames, which go to the
+ * decode's processor (its capture, on this thread) or to its sink (the
+ * owner's mailbox). The sink may hold `window` chunks the owner hasn't
+ * acknowledged (mai__dec_ack); the next waits, so memory stays bounded
+ * whatever the file's length. The pushes and the platform's loop check the
+ * cancel flag: a cancel (mai__dec_cancel) stops a decode within one codec
+ * buffer, or at once while it waits for an ack.
+ *
+ * g_dec_lock guards the slots (used, id), cancelled and inflight, and is
+ * held for the sink's started, chunk and ended: once mai__dec_cancel has
+ * answered MAI_OK, the owner gets nothing for the decode but its cancelled
+ * end. */
+
+#define MAI_MAX_DECODES 4 /* slot index: the id's low MAI_SLOT_BITS, as streams */
+_Static_assert(MAI_MAX_DECODES <= (1 << MAI_SLOT_BITS), "a decode's slot fits the id's slot bits");
+
+/* What mai__dec_begin and the pushes answer. */
+#define MAI_DEC_GO 0
+#define MAI_DEC_STOP 1      /* cancelled, or the owner is gone */
+#define MAI_DEC_TOO_LONG 2  /* past max_ms */
+#define MAI_DEC_NO_MEMORY 3
+#define MAI_DEC_FORMAT 4    /* no rate or channels, or the channel count changed mid-file */
+
+/* How a decode ended: its owner's last message. */
+enum { MAI_DEC_DONE = 0, MAI_DEC_CANCELLED = 1, MAI_DEC_FAILED = 2 };
+
+typedef struct mai_decode mai_decode;
+
+/* Where a decode's messages go (the NIF: the owner). started, chunk and
+ * ended run under g_dec_lock; buffer and release don't. */
+typedef struct mai_dec_sink {
+    /* A buffer for the next chunk, room for `samples` floats; NULL: no memory. */
+    float *(*buffer)(mai_decode *d, size_t samples);
+    /* A buffer from `buffer` that won't be sent. */
+    void (*release)(mai_decode *d, float *buf);
+    /* The format is known (d->rate, channels, declared_frames). False: the owner is gone. */
+    bool (*started)(mai_decode *d);
+    /* `frames` frames in `buf` (from `buffer`, the sink's from now on). False: the owner is gone. */
+    bool (*chunk)(mai_decode *d, float *buf, int32_t frames);
+    /* The end, `how` a MAI_DEC_DONE/CANCELLED/FAILED; MAI_DEC_FAILED with an
+     * error atom in `reason` and maybe a `detail` ("" if none). */
+    void (*ended)(mai_decode *d, int how, const char *reason, const char *detail);
+} mai_dec_sink;
+
+struct mai_decode {
+    /* g_dec_lock */
+    bool used;
+    int32_t id;
+    bool cancelled;
+    int32_t inflight; /* chunks sent and not yet acknowledged */
+    pthread_cond_t acked;
+    /* Set before the worker starts. */
     bool mono;
-    bool (*grow)(struct mai_pcm *pcm, size_t bytes);
-    void *user;
-} mai_pcm;
+    int32_t chunk_frames; /* frames per chunk, the last one shorter */
+    int32_t window;       /* chunks the owner may hold unacknowledged */
+    int64_t max_ms;       /* 0: no cap */
+    const mai_dec_sink *sink;
+    void *user;       /* the sink's own */
+    mai_entry *entry; /* the processor chunks go to (pinned); NULL: the sink's owner */
+    mai_processor p;
+    void *ctx;
+    /* The worker's. */
+    _Atomic bool stop; /* cancelled: what the worker polls without the lock */
+    bool begun;        /* the sink's started went out (and the processor's STARTED) */
+    int32_t rate, channels, src_channels;
+    int64_t declared_frames; /* the length the file states, at `rate`; -1: unknown */
+    int64_t max_frames;      /* 0: no cap */
+    float *buf;              /* the chunk being filled */
+    int32_t buf_n;           /* its frames */
+    int64_t frames;          /* frames delivered, and those in buf */
+};
 
-/* Results of the pushes. */
-#define MAI_PCM_OK 0
-#define MAI_PCM_TOO_LARGE 1 /* over max_bytes */
-#define MAI_PCM_NO_MEMORY 2 /* grow failed */
-#define MAI_PCM_CHANNELS 3  /* the source's channel count changed mid-file */
+static pthread_mutex_t g_dec_lock = PTHREAD_MUTEX_INITIALIZER;
+static mai_decode g_decodes[MAI_MAX_DECODES];
 
-static int mai__pcm_reserve(mai_pcm *p, size_t frames, int32_t src_channels) {
-    int32_t ch = p->mono ? 1 : src_channels;
-    if (ch <= 0) return MAI_PCM_CHANNELS;
-    if (p->channels == 0) p->channels = ch;
-    if (p->channels != ch) return MAI_PCM_CHANNELS;
-    size_t need = (p->frames + frames) * (size_t)ch * sizeof(float);
-    if (need > p->max_bytes) return MAI_PCM_TOO_LARGE;
-    if (need <= p->cap) return MAI_PCM_OK;
-    size_t cap = p->cap ? p->cap : 1u << 16;
-    if (cap > p->max_bytes) cap = p->max_bytes;
-    while (cap < need) cap = cap > p->max_bytes / 2 ? p->max_bytes : cap * 2;
-    return p->grow(p, cap) ? MAI_PCM_OK : MAI_PCM_NO_MEMORY;
-}
-
-/* Append `frames` interleaved float frames of `src_channels`. */
-MAI_HELPER int mai__pcm_push_f32(mai_pcm *p, const float *x, size_t frames, int32_t src_channels) {
-    int r = mai__pcm_reserve(p, frames, src_channels);
-    if (r != MAI_PCM_OK) return r;
-    float *o = p->data + p->frames * (size_t)p->channels;
-    if (!p->mono) {
-        memcpy(o, x, frames * (size_t)src_channels * sizeof(float));
-    } else {
-        for (size_t f = 0; f < frames; f++) {
-            float sum = 0.0f;
-            for (int32_t c = 0; c < src_channels; c++) sum += x[f * (size_t)src_channels + (size_t)c];
-            o[f] = sum / (float)src_channels;
-        }
+/* A free slot, zeroed, with a fresh id; NULL while MAI_MAX_DECODES run.
+ * The caller sets the options and the sink, then starts the worker or
+ * gives the slot back with mai__dec_discard. */
+MAI_HELPER mai_decode *mai__dec_alloc(void) {
+    pthread_mutex_lock(&g_dec_lock);
+    for (int i = 0; i < MAI_MAX_DECODES; i++) {
+        mai_decode *d = &g_decodes[i];
+        if (d->used) continue;
+        memset(d, 0, sizeof *d);
+        d->used = true;
+        d->id = (int32_t)((mai__next_gen() << MAI_SLOT_BITS) | (uint32_t)i);
+        d->declared_frames = -1;
+        pthread_cond_init(&d->acked, NULL);
+        pthread_mutex_unlock(&g_dec_lock);
+        return d;
     }
-    p->frames += frames;
-    return MAI_PCM_OK;
+    pthread_mutex_unlock(&g_dec_lock);
+    return NULL;
 }
 
-/* Append `frames` interleaved 16-bit frames of `src_channels`, as floats. */
-MAI_HELPER int mai__pcm_push_s16(mai_pcm *p, const int16_t *x, size_t frames, int32_t src_channels) {
-    int r = mai__pcm_reserve(p, frames, src_channels);
-    if (r != MAI_PCM_OK) return r;
-    float *o = p->data + p->frames * (size_t)p->channels;
-    for (size_t f = 0; f < frames; f++) {
-        if (!p->mono) {
-            for (int32_t c = 0; c < src_channels; c++)
-                o[f * (size_t)src_channels + (size_t)c] = x[f * (size_t)src_channels + (size_t)c] / 32768.0f;
+/* (g_dec_lock held) The running decode `id`, or NULL. */
+static mai_decode *mai__dec_find_locked(int32_t id) {
+    if (id <= 0) return NULL;
+    uint32_t slot = (uint32_t)id & ((1u << MAI_SLOT_BITS) - 1);
+    if (slot >= MAI_MAX_DECODES) return NULL;
+    mai_decode *d = &g_decodes[slot];
+    return d->used && d->id == id ? d : NULL;
+}
+
+/* Send the chunks to processor `name` instead of the owner. */
+MAI_HELPER int32_t mai__dec_use_processor(mai_decode *d, const char *name) {
+    return mai__pin(name, &d->entry, &d->p, &d->ctx);
+}
+
+/* Give back a slot whose worker never started. */
+MAI_HELPER void mai__dec_discard(mai_decode *d) {
+    mai__unpin(&d->entry);
+    pthread_mutex_lock(&g_dec_lock);
+    pthread_cond_destroy(&d->acked);
+    d->used = false;
+    pthread_mutex_unlock(&g_dec_lock);
+}
+
+/* Cancel decode `id` (any thread): MAI_OK, and the owner gets nothing more
+ * for it but its cancelled end; MAI_ERR_NOT_OPEN when it has ended (its
+ * last message is already sent). */
+MAI_HELPER int32_t mai__dec_cancel(int32_t id) {
+    pthread_mutex_lock(&g_dec_lock);
+    mai_decode *d = mai__dec_find_locked(id);
+    if (d) {
+        d->cancelled = true;
+        atomic_store_explicit(&d->stop, true, memory_order_relaxed);
+        pthread_cond_signal(&d->acked);
+    }
+    pthread_mutex_unlock(&g_dec_lock);
+    return d ? MAI_OK : MAI_ERR_NOT_OPEN;
+}
+
+/* The owner is done with `n` chunks of decode `id`: as many more may go out
+ * (more acks than chunks sent count as all of them). MAI_ERR_NOT_OPEN when
+ * it has ended. */
+MAI_HELPER int32_t mai__dec_ack(int32_t id, int32_t n) {
+    if (n <= 0) return MAI_ERR_INVALID;
+    pthread_mutex_lock(&g_dec_lock);
+    mai_decode *d = mai__dec_find_locked(id);
+    if (d) {
+        d->inflight = d->inflight > n ? d->inflight - n : 0;
+        pthread_cond_signal(&d->acked);
+    }
+    pthread_mutex_unlock(&g_dec_lock);
+    return d ? MAI_OK : MAI_ERR_NOT_OPEN;
+}
+
+/* (the worker) Cancelled, or the owner is gone: the platform's loop polls
+ * it every codec buffer and stops. */
+MAI_HELPER bool mai__dec_stopping(mai_decode *d) { return atomic_load_explicit(&d->stop, memory_order_relaxed); }
+
+/* A MAI_DEC_* push result as the decode's error atom ("cancelled" for
+ * MAI_DEC_STOP), with a detail where it needs one. */
+MAI_HELPER const char *mai__dec_reason(int r, char *detail, size_t detail_n) {
+    switch (r) {
+    case MAI_DEC_STOP: return "cancelled";
+    case MAI_DEC_TOO_LONG: return "too_long";
+    case MAI_DEC_NO_MEMORY: return "no_memory";
+    default:
+        if (detail && detail_n) snprintf(detail, detail_n, "no rate or channel count, or it changed mid-file");
+        return "decode_error";
+    }
+}
+
+/* Hand the filled part of the chunk on: to the processor's capture, or to
+ * the owner once fewer than `window` chunks are unacknowledged (waiting for
+ * an ack, or a cancel). */
+static int mai__dec_deliver(mai_decode *d) {
+    int32_t n = d->buf_n;
+    if (n == 0) return MAI_DEC_GO;
+    if (mai__dec_stopping(d)) return MAI_DEC_STOP;
+    if (d->entry) {
+        if (d->p.capture) {
+            mai_time t = {d->frames - n, mai_now_ns(), 0, d->rate, d->channels};
+            d->p.capture(d->ctx, d->buf, n, &t);
+        }
+        d->buf_n = 0;
+        return MAI_DEC_GO;
+    }
+    pthread_mutex_lock(&g_dec_lock);
+    while (!d->cancelled && d->inflight >= d->window) pthread_cond_wait(&d->acked, &g_dec_lock);
+    bool ok = !d->cancelled;
+    if (ok) {
+        ok = d->sink->chunk(d, d->buf, n);
+        d->buf = NULL;
+        d->buf_n = 0;
+        if (ok) d->inflight++;
+    }
+    pthread_mutex_unlock(&g_dec_lock);
+    return ok ? MAI_DEC_GO : MAI_DEC_STOP;
+}
+
+/* (the worker, once) The source's format: its rate, its channel count and
+ * the length it states in frames (<= 0: unknown). The owner learns it
+ * (started) and the processor gets STARTED; MAI_DEC_TOO_LONG at once when
+ * the stated length is past max_ms. */
+MAI_HELPER int mai__dec_begin(mai_decode *d, int32_t rate, int32_t src_channels, int64_t declared_frames) {
+    if (d->begun || rate <= 0 || src_channels <= 0) return MAI_DEC_FORMAT;
+    d->rate = rate;
+    d->src_channels = src_channels;
+    d->channels = d->mono ? 1 : src_channels;
+    d->declared_frames = declared_frames > 0 ? declared_frames : -1;
+    d->max_frames = d->max_ms > 0 ? d->max_ms * rate / 1000 : 0;
+    if (d->entry) {
+        d->buf = malloc(sizeof(float) * (size_t)d->chunk_frames * (size_t)d->channels);
+        if (!d->buf) return MAI_DEC_NO_MEMORY;
+    }
+    pthread_mutex_lock(&g_dec_lock);
+    bool ok = !d->cancelled && d->sink->started(d);
+    pthread_mutex_unlock(&g_dec_lock);
+    if (!ok) return MAI_DEC_STOP;
+    d->begun = true;
+    if (d->entry && d->p.stream_event) {
+        mai_time t = {0, mai_now_ns(), 0, d->rate, d->channels};
+        d->p.stream_event(d->ctx, d->id, MAI_EVENT_STARTED, &t);
+    }
+    if (d->max_frames && d->declared_frames > d->max_frames) return MAI_DEC_TOO_LONG;
+    return MAI_DEC_GO;
+}
+
+enum { MAI_DEC_F32 = 0, MAI_DEC_S16 = 1 };
+
+static inline float mai__dec_sample(const void *x, size_t i, int fmt) {
+    return fmt == MAI_DEC_S16 ? ((const int16_t *)x)[i] / 32768.0f : ((const float *)x)[i];
+}
+
+/* `frames` interleaved frames of the begun format into chunks. */
+static int mai__dec_push(mai_decode *d, const void *x, size_t frames, int32_t src_channels, int fmt) {
+    if (!d->begun || src_channels != d->src_channels) return MAI_DEC_FORMAT;
+    const size_t ch = (size_t)src_channels;
+    size_t at = 0; /* the next source sample */
+    while (frames > 0) {
+        if (mai__dec_stopping(d)) return MAI_DEC_STOP;
+        if (!d->buf && !(d->buf = d->sink->buffer(d, (size_t)d->chunk_frames * (size_t)d->channels)))
+            return MAI_DEC_NO_MEMORY;
+        size_t room = (size_t)(d->chunk_frames - d->buf_n);
+        size_t n = frames < room ? frames : room;
+        if (d->max_frames && d->frames + (int64_t)n > d->max_frames) return MAI_DEC_TOO_LONG;
+        float *o = d->buf + (size_t)d->buf_n * (size_t)d->channels;
+        if (d->mono) {
+            for (size_t f = 0; f < n; f++, at += ch) {
+                float sum = 0.0f;
+                for (size_t c = 0; c < ch; c++) sum += mai__dec_sample(x, at + c, fmt);
+                o[f] = sum / (float)ch;
+            }
+        } else if (fmt == MAI_DEC_F32) {
+            memcpy(o, (const float *)x + at, n * ch * sizeof(float));
+            at += n * ch;
         } else {
-            float sum = 0.0f;
-            for (int32_t c = 0; c < src_channels; c++) sum += x[f * (size_t)src_channels + (size_t)c] / 32768.0f;
-            o[f] = sum / (float)src_channels;
+            for (size_t i = 0; i < n * ch; i++, at++) o[i] = mai__dec_sample(x, at, fmt);
+        }
+        d->buf_n += (int32_t)n;
+        d->frames += (int64_t)n;
+        frames -= n;
+        if (d->buf_n == d->chunk_frames) {
+            int r = mai__dec_deliver(d);
+            if (r != MAI_DEC_GO) return r;
         }
     }
-    p->frames += frames;
-    return MAI_PCM_OK;
+    return MAI_DEC_GO;
+}
+
+/* Append interleaved float or 16-bit frames of `src_channels`. */
+MAI_HELPER int mai__dec_push_f32(mai_decode *d, const float *x, size_t frames, int32_t src_channels) {
+    return mai__dec_push(d, x, frames, src_channels, MAI_DEC_F32);
+}
+
+MAI_HELPER int mai__dec_push_s16(mai_decode *d, const int16_t *x, size_t frames, int32_t src_channels) {
+    return mai__dec_push(d, x, frames, src_channels, MAI_DEC_S16);
+}
+
+/* (the worker's last call) `reason` NULL: the file ended, the rest goes
+ * out; else the error atom that stopped the decode ("cancelled" for a
+ * push's MAI_DEC_STOP) and its `detail`. The processor gets STOPPED (after
+ * every STARTED), the processor is unpinned and the owner gets the end: a
+ * cancel wins over the rest. The slot is free once this returns. */
+MAI_HELPER void mai__dec_end(mai_decode *d, const char *reason, const char *detail) {
+    char own[MAI_ERRMAX] = "";
+    if (!reason) {
+        int r = mai__dec_deliver(d);
+        if (r != MAI_DEC_GO) {
+            reason = mai__dec_reason(r, own, sizeof own);
+            detail = own;
+        } else if (d->frames == 0) {
+            reason = "no_audio";
+        }
+    }
+    /* the chunk left unsent (a failure, a cancel) doesn't count: frames
+     * is now what the owner or the processor got */
+    d->frames -= d->buf_n;
+    d->buf_n = 0;
+    if (d->entry) {
+        if (d->begun && d->p.stream_event) {
+            mai_time t = {d->frames, mai_now_ns(), 0, d->rate, d->channels};
+            d->p.stream_event(d->ctx, d->id, MAI_EVENT_STOPPED, &t);
+        }
+        free(d->buf);
+    } else if (d->buf) {
+        d->sink->release(d, d->buf);
+    }
+    d->buf = NULL;
+    mai__unpin(&d->entry);
+    pthread_mutex_lock(&g_dec_lock);
+    int how = d->cancelled || (reason && strcmp(reason, "cancelled") == 0) ? MAI_DEC_CANCELLED
+              : reason                                                     ? MAI_DEC_FAILED
+                                                                           : MAI_DEC_DONE;
+    d->sink->ended(d, how, reason, detail ? detail : "");
+    pthread_cond_destroy(&d->acked);
+    d->used = false;
+    pthread_mutex_unlock(&g_dec_lock);
 }

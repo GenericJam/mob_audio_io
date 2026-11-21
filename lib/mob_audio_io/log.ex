@@ -3,9 +3,10 @@ defmodule MobAudioIo.Log do
   Logs what the native side reports, with a `[mob_audio_io]` prefix.
 
   Native code can't reach Logger (and so not Sloppy Joe's `logs`), so the
-  NIF's event thread sends this process a copy of every stream message but
-  `:post`. Started, unsupervised and unlinked, by the first
-  `MobAudioIo.Native.open/3`; it lives for the app's life.
+  NIF sends this process a copy of every stream message but `:post`, and
+  of every decode message but the `:decoded` chunks. Started, unsupervised
+  and unlinked, by the first `MobAudioIo.Native.open/3` or
+  `decode_stream/3`; it lives for the app's life.
   """
   use GenServer
 
@@ -27,8 +28,12 @@ defmodule MobAudioIo.Log do
   def init(nil), do: {:ok, nil}
 
   @impl true
-  def handle_info({:mob_audio_io, kind, stream, info}, state) do
-    Logger.log(level(kind, info), "[mob_audio_io] stream #{stream} #{kind} #{inspect(info)}")
+  def handle_info({:mob_audio_io, kind, id, info}, state) do
+    Logger.log(
+      level(kind, info),
+      "[mob_audio_io] #{subject(kind)} #{id} #{kind} #{inspect(info)}"
+    )
+
     {:noreply, state}
   end
 
@@ -36,7 +41,15 @@ defmodule MobAudioIo.Log do
 
   @doc false
   @spec level(atom(), term()) :: Logger.level()
-  def level(kind, _info) when kind in [:error, :device_lost, :xrun, :interrupted], do: :warning
+  def level(kind, _info) when kind in [:error, :device_lost, :xrun, :interrupted, :decode_error],
+    do: :warning
+
   def level(:stopped, %{posts_dropped: n}) when n > 0, do: :warning
   def level(_kind, _info), do: :info
+
+  defp subject(kind)
+       when kind in [:decode_started, :decode_done, :decode_cancelled, :decode_error],
+       do: "decode"
+
+  defp subject(_kind), do: "stream"
 end

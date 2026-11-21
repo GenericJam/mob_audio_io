@@ -22,12 +22,16 @@ follows).
 * `priv/native/common/mai_core.c`: registry, stream table, `mai__process`
   (capture then render, stream clock, input meter, counters), the
   presentation-time anchor (seqlock) and timing math, the `mai_post` SPSC
-  ring, the PCM buffer decoders fill. No erl_nif, no platform API:
+  ring, and the streaming decode's state machine (`mai__dec_*`: slots and
+  ids, mono fold, chunking, `max_ms`, the ack window, cancel, the sink or
+  processor the chunks go to). No erl_nif, no platform API:
   `test/c/mai_core_test.c` runs it on the host.
 * `priv/native/common/mai_nif.c`: the NIF functions, owner monitors, the
   event thread (reopen with backoff, xrun tuning, the anchor poll, posts,
-  messages; parked on a condvar while no stream is open), and the `be_*`
-  backend interface the platform files implement.
+  messages; parked on a condvar while no stream is open), a thread per
+  file decode (`decode_main`: `be_decode`, then the end; the sink sends the
+  owner its messages), and the `be_*` backend interface the platform files
+  implement.
 * `priv/native/android/mob_audio_io_nif.c`: AAudio (dlopen), JNI (devices,
   RECORD_AUDIO), AMediaCodec decoding (dlopen).
 * `priv/native/ios/mob_audio_io_nif.m`: the `AVAudioSession` policy across
@@ -38,9 +42,10 @@ follows).
   are the same code on both; `scripts/check_abi_symbols.sh` checks it in CI.
 * `src/mob_audio_io_nif.erl`: the NIF's Erlang module.
 * `lib/mob_audio_io.ex` (API, option validation, the moduledoc is the
-  spec), `native.ex`, `fake.ex` + `fake/wav.ex`, `backend.ex` (behaviour),
-  `log.ex` (logs native events with the `[mob_audio_io]` prefix),
-  `self_test.ex`.
+  spec; `decode/2` collects a `decode_stream/3`), `native.ex`, `fake.ex` +
+  `fake/wav.ex` + `fake/decoder.ex` (a process per Fake decode),
+  `backend.ex` (behaviour), `log.ex` (logs native events with the
+  `[mob_audio_io]` prefix), `self_test.ex`.
 * `example/`: a `mob.new` app (`com.genericjam.audioiospike`) whose
   `c_src/spike_dsp.c` (+ `verify_dsp.c`) registers a click, Magpie's
   sampler core, `"tone_loop"` and `"loop_latency"`. `AudioIoSpike.Probe` is
@@ -48,11 +53,16 @@ follows).
 
 ## Testing
 
-`mix test` (Fake backend, option validation, WAV decoding, self-test
-classification, and the C core's host test when `cc` exists). CI also runs
-the C core under ASan+UBSan and TSan, compiles the Android NIF with the NDK
-and the iOS NIF with Xcode's clang (`-Werror`), checks the ABI symbols, and
-runs the Apple C parts against CoreAudio on macOS.
+`mix test` (Fake backend, option validation, WAV decoding and the Fake's
+streaming decode, self-test classification, and the C core's host test when
+`cc` exists). CI also runs the C core under ASan+UBSan and TSan, compiles
+the Android NIF with the NDK and the iOS NIF with Xcode's clang
+(`-Werror`), checks the ABI symbols, runs the Apple C parts against
+CoreAudio on macOS (streaming 5-minute WAV/M4A/MP3 files: memory, cancel),
+and loads the real NIF into a host BEAM (`test/c/mai_nif_host.c`, the
+ExtAudioFile decode and no streams) for `test/host_nif_smoke.exs`. On this
+Mac run `test/c/mai_apple_test.c` with `MAI_APPLE_TEST_NO_HARDWARE=1`: its
+hardware part opens the default output (silent, but it is the speaker).
 
 On a device: `cd example`, zig **0.17.0** first on `PATH`
 (`~/.local/share/mise/installs/zig/0.17.0/bin`), lease the device
@@ -100,3 +110,8 @@ first; then watch the `release` and `tests` runs and confirm with
 * MOB_RELEASE doesn't reach plugin code (MOB-510): there is no test-only
   native code here; `reset_stats/1` and the built-in processors are safe to
   ship.
+* A decode's messages to its owner go out under `g_dec_lock` (that is what
+  makes "nothing after `decode_cancel/1` but `:decode_cancelled`" hold);
+  `decode_ack/2` and `decode_cancel/1` take it on a normal scheduler, so
+  keep the work under it to a send. A processor's `capture` runs outside
+  it, on the decode's thread.

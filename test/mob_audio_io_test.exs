@@ -232,6 +232,145 @@ defmodule MobAudioIoTest do
     end
   end
 
+  describe "decode_stream/3 with the Fake" do
+    # 1000 frames of 8 kHz mono 16-bit, sample i = i.
+    defp ramp(dir) do
+      path = Path.join(dir, "ramp.wav")
+      File.write!(path, wav(1, 16, 1, 8_000, for(i <- 0..999, into: <<>>, do: <<i::little-16>>)))
+      path
+    end
+
+    defp frames_of(bin), do: div(byte_size(bin), 4)
+
+    test "chunks come within the window, one more per ack, then the end", %{tmp_dir: dir} do
+      path = ramp(dir)
+      assert {:ok, d} = MobAudioIo.decode_stream(path, self(), chunk_frames: 256, window: 2)
+
+      assert_receive {:mob_audio_io, :decode_started, ^d,
+                      %{rate: 8_000, channels: 1, frames: 1000}}
+
+      assert_receive {:mob_audio_io, :decoded, ^d, c1}
+      assert_receive {:mob_audio_io, :decoded, ^d, c2}
+      refute_receive {:mob_audio_io, _, ^d, _}, 50
+
+      assert :ok = MobAudioIo.decode_ack(d)
+      assert_receive {:mob_audio_io, :decoded, ^d, c3}
+      refute_receive {:mob_audio_io, _, ^d, _}, 50
+
+      assert :ok = MobAudioIo.decode_ack(d, 2)
+      assert_receive {:mob_audio_io, :decoded, ^d, c4}
+      assert_receive {:mob_audio_io, :decode_done, ^d, %{frames: 1000, rate: 8_000, channels: 1}}
+      assert Enum.map([c1, c2, c3, c4], &frames_of/1) == [256, 256, 256, 232]
+
+      {:ok, whole} = MobAudioIo.decode(path)
+      assert IO.iodata_to_binary([c1, c2, c3, c4]) == whole.data
+      assert {:error, :not_running} = MobAudioIo.decode_ack(d)
+    end
+
+    test "after decode_cancel/1 only :decode_cancelled arrives", %{tmp_dir: dir} do
+      assert {:ok, d} = MobAudioIo.decode_stream(ramp(dir), self(), chunk_frames: 256, window: 1)
+      assert_receive {:mob_audio_io, :decode_started, ^d, _}
+      assert_receive {:mob_audio_io, :decoded, ^d, _}
+      assert :ok = MobAudioIo.decode_cancel(d)
+      assert_receive {:mob_audio_io, :decode_cancelled, ^d, %{frames: 256}}
+      refute_receive {:mob_audio_io, _, ^d, _}, 50
+      assert {:error, :not_running} = MobAudioIo.decode_cancel(d)
+    end
+
+    test "a cancel after the end answers :not_running", %{tmp_dir: dir} do
+      assert {:ok, d} = MobAudioIo.decode_stream(ramp(dir), self(), chunk_frames: 1024)
+      assert_receive {:mob_audio_io, :decode_done, ^d, _}
+      assert {:error, :not_running} = MobAudioIo.decode_cancel(d)
+    end
+
+    test "the owner's exit stops it", %{tmp_dir: dir} do
+      path = ramp(dir)
+      test = self()
+
+      owner =
+        spawn(fn ->
+          send(test, MobAudioIo.decode_stream(path, self(), chunk_frames: 256, window: 1))
+          receive do: (:never -> :ok)
+        end)
+
+      assert_receive {:ok, d}
+      Process.exit(owner, :kill)
+      assert eventually(fn -> MobAudioIo.decode_cancel(d) == {:error, :not_running} end)
+    end
+
+    test "max_ms refuses a longer file before any chunk", %{tmp_dir: dir} do
+      path = ramp(dir)
+      # 1000 frames at 8 kHz: 125 ms
+      assert {:ok, d} = MobAudioIo.decode_stream(path, self(), max_ms: 124)
+      assert_receive {:mob_audio_io, :decode_started, ^d, _}
+      assert_receive {:mob_audio_io, :decode_error, ^d, %{reason: :too_long, frames: 0}}
+      refute_received {:mob_audio_io, :decoded, ^d, _}
+
+      assert {:ok, d} = MobAudioIo.decode_stream(path, self(), max_ms: 125)
+      assert_receive {:mob_audio_io, :decode_done, ^d, %{frames: 1000}}
+    end
+
+    test "a processor takes the chunks: the owner gets the format and the end", %{tmp_dir: dir} do
+      path = ramp(dir)
+
+      assert {:error, :unknown_processor} =
+               MobAudioIo.decode_stream(path, self(), processor: "hum_file")
+
+      Fake.register_processor("hum_file")
+      assert {:ok, d} = MobAudioIo.decode_stream(path, self(), processor: "hum_file", window: 1)
+      assert_receive {:mob_audio_io, :decode_started, ^d, %{rate: 8_000}}
+      assert_receive {:mob_audio_io, :decode_done, ^d, %{frames: 1000}}
+      refute_received {:mob_audio_io, :decoded, ^d, _}
+    end
+
+    test "errors arrive as :decode_error; 4 decodes at once", %{tmp_dir: dir} do
+      assert {:ok, d} = MobAudioIo.decode_stream(Path.join(dir, "none.wav"), self())
+      assert_receive {:mob_audio_io, :decode_error, ^d, %{reason: :not_found, detail: nil}}
+
+      path = ramp(dir)
+
+      for _ <- 1..4,
+          do:
+            assert(
+              {:ok, _} = MobAudioIo.decode_stream(path, self(), chunk_frames: 256, window: 1)
+            )
+
+      assert {:error, :busy} = MobAudioIo.decode_stream(path, self())
+    end
+
+    test "bad options" do
+      for {opts, key} <- [
+            {[chunk_frames: 255], :chunk_frames},
+            {[chunk_frames: 65_537], :chunk_frames},
+            {[window: 0], :window},
+            {[max_ms: 0], :max_ms},
+            {[processor: ""], :processor},
+            {[mono: 1], :mono},
+            {[rate: 44_100], :rate},
+            {[:mono], :opts}
+          ] do
+        assert {:error, {:invalid_option, ^key}} =
+                 MobAudioIo.decode_stream("/a.wav", self(), opts)
+      end
+
+      assert {:error, {:invalid_option, :opts}} = MobAudioIo.decode_stream("/a.wav", self(), %{})
+    end
+  end
+
+  defp eventually(fun, tries \\ 100) do
+    cond do
+      fun.() ->
+        true
+
+      tries == 0 ->
+        false
+
+      true ->
+        Process.sleep(10)
+        eventually(fun, tries - 1)
+    end
+  end
+
   describe "the native backend on the host" do
     test "answers :unsupported, never raises" do
       Application.put_env(:mob_audio_io, :backend, MobAudioIo.Native)
@@ -242,6 +381,9 @@ defmodule MobAudioIoTest do
       assert {:error, :unsupported} = MobAudioIo.processors()
       assert {:error, :unsupported} = MobAudioIo.devices(:input)
       assert {:error, :unsupported} = MobAudioIo.decode("/tmp/none.wav")
+      assert {:error, :unsupported} = MobAudioIo.decode_stream("/tmp/none.wav", self())
+      assert {:error, :unsupported} = MobAudioIo.decode_ack(1)
+      assert {:error, :unsupported} = MobAudioIo.decode_cancel(1)
       refute MobAudioIo.Native.available?()
     end
   end

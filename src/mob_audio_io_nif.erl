@@ -16,7 +16,9 @@
     reset_stats/1,
     processors/0,
     devices/1,
-    decode/3,
+    decode_stream/3,
+    decode_ack/2,
+    decode_cancel/1,
     set_logger/1,
     abi_version/0
 ]).
@@ -56,9 +58,20 @@ processors() ->
 devices(_Direction) ->
     erlang:nif_error(nif_not_loaded).
 
-%% decode(Path, MaxBytes, Mono) -> {ok, #{rate, channels, frames, data}}
-%%   | {error, Reason} | {error, {Reason, Detail}}
-decode(_Path, _MaxBytes, _Mono) ->
+%% decode_stream(Path, Owner, Opts) -> {ok, Id} | {error, busy | unknown_processor | no_memory}
+%%   Opts: #{mono, chunk_frames, window, max_ms (0: none),
+%%           processor (<<>>: the owner gets the chunks)}
+%% The owner gets {mob_audio_io, decode_started | decoded | decode_done |
+%% decode_cancelled | decode_error, Id, Payload}.
+decode_stream(_Path, _Owner, _Opts) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% decode_ack(Id, N) -> ok | {error, not_running}
+decode_ack(_Id, _N) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% decode_cancel(Id) -> ok | {error, not_running}
+decode_cancel(_Id) ->
     erlang:nif_error(nif_not_loaded).
 
 set_logger(_PidOrNil) ->

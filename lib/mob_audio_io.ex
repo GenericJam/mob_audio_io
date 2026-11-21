@@ -9,7 +9,7 @@ defmodule MobAudioIo do
   from the audio thread: `render` for output, `capture` for input, both (in
   that order, in one callback) for duplex. Audio never passes through the
   BEAM; Elixir opens and closes streams, reads `status/0`, lists devices,
-  decodes files and receives the stream's messages.
+  decodes files (in chunks, cancellably) and receives the stream's messages.
 
   ## Platforms
 
@@ -19,7 +19,7 @@ defmodule MobAudioIo do
   | `:input` | AAudio with an input preset | RemoteIO input (VoiceProcessingIO for `preset: :voice`) | `{:error, :unsupported}` |
   | `:duplex` | AAudio output, the input read in its callback | one RemoteIO unit, input pulled in the render | `{:error, :unsupported}` |
   | `devices/1` | `AudioManager.getDevices` (JNI) | `AVAudioSession` inputs, the current route's outputs | `{:error, :unsupported}` |
-  | `decode/2` | `AMediaExtractor` + `AMediaCodec` | `ExtAudioFile` | `{:error, :unsupported}` |
+  | `decode_stream/3`, `decode/2` | `AMediaExtractor` + `AMediaCodec` | `ExtAudioFile` | `{:error, :unsupported}` |
   | `device:` (output) | an AAudio device id | `{:error, :unsupported}` (iOS routes output itself) | |
   | Presentation time | AAudio timestamps on 12+; an estimate from the buffer on 8-11 | `AudioTimeStamp.mHostTime` + the session's latency | |
 
@@ -68,6 +68,52 @@ defmodule MobAudioIo do
   them in tests. Every one but `:post` is also logged with a
   `[mob_audio_io]` prefix (`MobAudioIo.Log`), so they reach Sloppy Joe's
   `logs`.
+
+  File decodes (`decode_stream/3`) send their own messages, as
+  `{:mob_audio_io, kind, decode, payload}` (a decode's id is never a
+  stream's), logged the same way but for the chunks: see "Decoding files".
+
+  ## Decoding files
+
+  `decode_stream/3` decodes a file on a thread of its own and hands the
+  PCM out in chunks as it decodes, so an app can analyse a long file
+  without holding all of it, and stop it at once. The owner gets, in
+  order:
+
+    * `:decode_started`, `%{rate:, channels:, frames:}`: the format, before
+      any chunk. `rate` is the file's (no resampling), `channels` 1 with
+      `mono: true`, `frames` the length the file states at `rate` (`nil`
+      if it states none; an estimate for compressed formats).
+    * `:decoded`, `binary`: `chunk_frames` frames (the last chunk fewer) of
+      interleaved 32-bit floats in the device's byte order. The owner calls
+      `decode_ack/2` once it is done with a chunk; at most `window` chunks
+      go out unacknowledged, and the decode waits for an ack before the
+      next, so memory stays at about `window + 1` chunks whatever the
+      file's length. None with `processor:`.
+    * Then exactly one of `:decode_done`, `%{frames:, rate:, channels:}`;
+      `:decode_cancelled`, `%{frames:}`; `:decode_error`, `%{reason:,
+      detail:, frames:}`. `reason`: `:not_found`, `:unsupported` (a format
+      the platform can't decode), `:no_audio`, `:too_long` (past
+      `max_ms:`), `:no_memory` or `:decode_error`; `detail` is the
+      platform's words or `nil`.
+
+  `decode_cancel/1` stops a decode within one codec buffer (an
+  `ExtAudioFileRead` of 4096 frames, an `AMediaCodec` buffer), or at once
+  while it waits for an ack, and releases the codec; `:decode_cancelled`
+  follows, and once `decode_cancel/1` has answered `:ok` nothing else
+  arrives for that decode. The decode is cancelled when its owner exits.
+
+  With `processor: name`, the chunks go to that registered processor's
+  `capture` on the decode's thread instead, so C analysis never passes
+  through the BEAM: `stream_event(ctx, decode, MAI_EVENT_STARTED, t)`
+  first (`t->rate`, `t->channels`), then `capture(ctx, chunk, frames, t)`
+  per chunk (`t->frame` is the chunk's first frame in the file), then
+  `MAI_EVENT_STOPPED` after the last, whether the decode finished, failed
+  or was cancelled. Every call of one decode runs on that decode's
+  thread, in that order; a processor used by several decodes (or by
+  streams) at once gets their calls concurrently. The decode's thread is
+  not real-time (a processor may allocate or lock there), but it waits
+  for `capture`. The owner still gets `:decode_started` and the end.
 
   ## Errors
 
@@ -133,6 +179,8 @@ defmodule MobAudioIo do
   @typedoc "A stream id, as `open/3` returned it."
   @type stream :: pos_integer()
   @type direction :: :output | :input | :duplex
+  @typedoc "A file decode's id, as `decode_stream/3` returned it."
+  @type decode :: pos_integer()
   @typedoc "An Android AAudio device id or an iOS port UID, as `devices/1` lists them."
   @type device_id :: integer() | String.t()
   @type preset :: :default | :generic | :performance | :unprocessed | :voice
@@ -148,6 +196,13 @@ defmodule MobAudioIo do
           | {:preset, preset()}
           | {:device, device_id() | nil}
           | {:input_device, device_id() | nil}
+  @type decode_option ::
+          {:mono, boolean()}
+          | {:chunk_frames, pos_integer()}
+          | {:window, pos_integer()}
+          | {:max_ms, pos_integer() | nil}
+          | {:processor, String.t() | nil}
+          | {:module, module()}
 
   @known_options [
     :processor,
@@ -164,8 +219,12 @@ defmodule MobAudioIo do
   ]
   @presets [:default, :generic, :performance, :unprocessed, :voice]
 
+  @decode_options [:mono, :chunk_frames, :window, :max_ms, :processor, :module]
+
   @default_max_bytes 64 * 1024 * 1024
   @max_max_bytes 1024 * 1024 * 1024
+  # decode/2's chunks: few messages; it acknowledges each as it comes.
+  @collect_chunk_frames 65_536
 
   @doc """
   Open a stream for `owner` and start it.
@@ -311,30 +370,95 @@ defmodule MobAudioIo do
   end
 
   @doc """
-  Decode an audio file to PCM: `{:ok, %{rate:, channels:, frames:, data:}}`,
-  `data` being `frames * channels` interleaved 32-bit floats in the
-  device's byte order (little-endian on every supported phone).
+  Decode an audio file for `owner` in chunks, on a thread of its own:
+  `{:ok, decode}`, then the messages "Decoding files" describes
+  (`:decode_started`, `:decoded` chunks the owner acknowledges with
+  `decode_ack/2`, and one end). Everything that goes wrong once it has
+  started, a missing file too, arrives as `:decode_error`.
 
-  WAV, MP3, AAC/M4A and whatever else the platform's decoders take. Runs on
-  a dirty scheduler, so a long file doesn't hold up the BEAM's schedulers.
+  WAV, MP3, AAC/M4A and whatever else the platform's decoders take, at the
+  file's own rate.
+
+  Options:
+
+    * `:mono`: fold every frame to one channel (default `false`).
+    * `:chunk_frames`: frames per chunk, 256 to 65 536 (default 4096).
+    * `:window`: chunks the owner may hold unacknowledged, 1 to 64
+      (default 4).
+    * `:max_ms`: refuse a file longer than this many milliseconds
+      (`:too_long`): at once when its stated length is longer, else as
+      soon as the decoded frames pass it. Default `nil`, no limit.
+    * `:processor`: a registered processor's name: its `capture` gets the
+      chunks on the decode's thread instead of the owner.
+    * `:module`: the app's NIF module that registers the processor; loaded
+      (`Code.ensure_loaded/1`) first.
+
+  Errors: `:busy` (4 decodes run), `:unknown_processor`, `:no_memory`,
+  `:unsupported` (the host), `{:module, reason}` and `{:invalid_option,
+  key}`.
+  """
+  @spec decode_stream(Path.t(), pid(), [decode_option()]) :: {:ok, decode()} | {:error, term()}
+  def decode_stream(path, owner, opts \\ []) when is_binary(path) and is_pid(owner) do
+    with {:ok, opts} <- decode_stream_options(opts),
+         {:ok, path} <- decode_path(path),
+         :ok <- load_module(opts.module),
+         {:ok, decode} <- backend().decode_stream(path, owner, opts) do
+      Logger.info("[mob_audio_io] decode #{decode}: #{Path.basename(path)}")
+      {:ok, decode}
+    else
+      {:error, reason} = error ->
+        Logger.warning("[mob_audio_io] decode #{Path.basename(path)} failed: #{inspect(reason)}")
+        error
+    end
+  end
+
+  @doc """
+  The owner is done with `n` of a decode's chunks (default 1): as many
+  more may come. `{:error, :not_running}` once the decode has ended.
+  """
+  @spec decode_ack(decode(), pos_integer()) :: :ok | {:error, :not_running | :unsupported}
+  def decode_ack(decode, n \\ 1) when is_integer(decode) and is_integer(n) and n > 0,
+    do: backend().decode_ack(decode, n)
+
+  @doc """
+  Stop a decode within one codec buffer and release its codec. `:ok`:
+  `:decode_cancelled` follows and nothing else arrives for it.
+  `{:error, :not_running}`: it had already ended, and its last message
+  (`:decode_done`, `:decode_error` or `:decode_cancelled`) was sent.
+  """
+  @spec decode_cancel(decode()) :: :ok | {:error, :not_running | :unsupported}
+  def decode_cancel(decode) when is_integer(decode), do: backend().decode_cancel(decode)
+
+  @doc """
+  Decode a whole audio file to PCM: `{:ok, %{rate:, channels:, frames:,
+  data:}}`, `data` being `frames * channels` interleaved 32-bit floats in
+  the device's byte order (little-endian on every supported phone).
+
+  The calling process runs a `decode_stream/3` and collects its chunks
+  (selectively receiving that decode's messages), so it waits for the
+  whole file and holds all of it: `decode_stream/3` is the way to analyse
+  a long file in bounded memory, or to stop early.
 
   Options:
 
     * `:max_bytes`: the most PCM to produce (default 64 MiB, about 2.9
       minutes of 48 kHz stereo; at most 1 GiB). A longer file answers
-      `{:error, :too_large}` rather than a partial result.
+      `{:error, :too_large}` rather than a partial result: at once when the
+      length the file states is too long, else when the PCM passes it.
     * `:mono`: fold every frame to one channel (default `false`).
 
   Errors: `:not_found`, `:unsupported` (the host, or a format the platform
   can't decode), `:no_audio`, `:too_large`, `:no_memory`, `:decode_error`,
-  each possibly as `{reason, detail}` with the platform's words, and
+  each possibly as `{reason, detail}` with the platform's words,
+  `:busy`, `:cancelled` (another process cancelled it) and
   `{:invalid_option, key}`.
   """
   @spec decode(Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def decode(path, opts \\ []) when is_binary(path) and is_list(opts) do
     with {:ok, max_bytes, mono} <- decode_options(opts),
          {:ok, path} <- decode_path(path),
-         {:ok, pcm} <- backend().decode(path, max_bytes, mono) do
+         {:ok, decode} <- backend().decode_stream(path, self(), collect_options(mono)),
+         {:ok, pcm} <- collect(decode, max_bytes, 0, []) do
       Logger.info(
         "[mob_audio_io] decoded #{Path.basename(path)}: #{pcm.frames} frames, #{pcm.channels} ch at #{pcm.rate} Hz"
       )
@@ -346,6 +470,67 @@ defmodule MobAudioIo do
         error
     end
   end
+
+  defp collect_options(mono) do
+    %{
+      mono: mono,
+      chunk_frames: @collect_chunk_frames,
+      window: 4,
+      max_ms: 0,
+      processor: "",
+      module: nil
+    }
+  end
+
+  # decode/2's owner side: every chunk, acknowledged as it comes; past
+  # max_bytes (the stated length, or the chunks so far) it cancels.
+  defp collect(decode, max_bytes, bytes, acc) do
+    receive do
+      {:mob_audio_io, :decode_started, ^decode, %{channels: channels, frames: frames}} ->
+        if is_integer(frames) and frames * channels * 4 > max_bytes,
+          do: abandon(decode, :too_large),
+          else: collect(decode, max_bytes, bytes, acc)
+
+      {:mob_audio_io, :decoded, ^decode, chunk} ->
+        _ = backend().decode_ack(decode, 1)
+        bytes = bytes + byte_size(chunk)
+
+        if bytes > max_bytes,
+          do: abandon(decode, :too_large),
+          else: collect(decode, max_bytes, bytes, [acc | chunk])
+
+      {:mob_audio_io, :decode_done, ^decode, %{frames: frames, rate: rate, channels: channels}} ->
+        {:ok, %{rate: rate, channels: channels, frames: frames, data: IO.iodata_to_binary(acc)}}
+
+      {:mob_audio_io, :decode_cancelled, ^decode, _info} ->
+        {:error, :cancelled}
+
+      {:mob_audio_io, :decode_error, ^decode, %{reason: reason, detail: detail}} ->
+        {:error, decode_error(reason, detail)}
+    end
+  end
+
+  defp abandon(decode, reason) do
+    _ = backend().decode_cancel(decode)
+    drain(decode)
+    {:error, reason}
+  end
+
+  # What's left of a decode's messages, up to its end.
+  defp drain(decode) do
+    receive do
+      {:mob_audio_io, kind, ^decode, _}
+      when kind in [:decode_done, :decode_cancelled, :decode_error] ->
+        :ok
+
+      {:mob_audio_io, _kind, ^decode, _} ->
+        drain(decode)
+    end
+  end
+
+  # :unsupported stays a plain atom: its detail adds nothing to match on.
+  defp decode_error(reason, detail) when reason == :unsupported or is_nil(detail), do: reason
+  defp decode_error(reason, detail), do: {reason, detail}
 
   @doc false
   @spec backend() :: module()
@@ -372,7 +557,7 @@ defmodule MobAudioIo do
   def normalize_options(direction, opts) when is_list(opts) do
     input? = direction in [:input, :duplex]
 
-    with :ok <- check_keys(opts),
+    with :ok <- check_keys(opts, @known_options),
          {:ok, processor} <- processor(opts[:processor]),
          {:ok, module} <- module(Keyword.get(opts, :module)),
          {:ok, rate} <- rate(Keyword.get(opts, :rate)),
@@ -405,9 +590,9 @@ defmodule MobAudioIo do
 
   def normalize_options(_direction, _), do: {:error, {:invalid_option, :opts}}
 
-  defp check_keys(opts) do
+  defp check_keys(opts, known) do
     case Enum.find(opts, fn
-           {key, _} -> key not in @known_options
+           {key, _} -> key not in known
            _ -> true
          end) do
       nil -> :ok
@@ -453,32 +638,57 @@ defmodule MobAudioIo do
   end
 
   defp decode_options(opts) do
-    case Enum.find(opts, fn
-           {key, _} -> key not in [:max_bytes, :mono]
-           _ -> true
-         end) do
-      nil ->
-        max_bytes = Keyword.get(opts, :max_bytes, @default_max_bytes)
-        mono = Keyword.get(opts, :mono, false)
-
-        cond do
-          not (is_integer(max_bytes) and max_bytes in 1..@max_max_bytes) ->
-            {:error, {:invalid_option, :max_bytes}}
-
-          not is_boolean(mono) ->
-            {:error, {:invalid_option, :mono}}
-
-          true ->
-            {:ok, max_bytes, mono}
-        end
-
-      {key, _} ->
-        {:error, {:invalid_option, key}}
-
-      _ ->
-        {:error, {:invalid_option, :opts}}
+    with :ok <- check_keys(opts, [:max_bytes, :mono]),
+         {:ok, max_bytes} <-
+           int_in(
+             :max_bytes,
+             Keyword.get(opts, :max_bytes, @default_max_bytes),
+             1..@max_max_bytes
+           ),
+         {:ok, mono} <- one_of(:mono, Keyword.get(opts, :mono, false), [true, false]) do
+      {:ok, max_bytes, mono}
     end
   end
+
+  @doc false
+  # decode_stream/3's options as the backends take them: %{mono,
+  # chunk_frames, window, max_ms (0: none), processor ("": the owner gets
+  # the chunks), module}.
+  @spec decode_stream_options(keyword()) :: {:ok, map()} | {:error, {:invalid_option, atom()}}
+  def decode_stream_options(opts) when is_list(opts) do
+    with :ok <- check_keys(opts, @decode_options),
+         {:ok, mono} <- one_of(:mono, Keyword.get(opts, :mono, false), [true, false]),
+         {:ok, chunk_frames} <-
+           int_in(:chunk_frames, Keyword.get(opts, :chunk_frames, 4096), 256..65_536),
+         {:ok, window} <- int_in(:window, Keyword.get(opts, :window, 4), 1..64),
+         {:ok, max_ms} <- max_ms(Keyword.get(opts, :max_ms)),
+         {:ok, processor} <- decode_processor(Keyword.get(opts, :processor)),
+         {:ok, module} <- module(Keyword.get(opts, :module)) do
+      {:ok,
+       %{
+         mono: mono,
+         chunk_frames: chunk_frames,
+         window: window,
+         max_ms: max_ms,
+         processor: processor,
+         module: module
+       }}
+    end
+  end
+
+  def decode_stream_options(_), do: {:error, {:invalid_option, :opts}}
+
+  defp int_in(key, value, range) do
+    if is_integer(value) and value in range,
+      do: {:ok, value},
+      else: {:error, {:invalid_option, key}}
+  end
+
+  defp max_ms(nil), do: {:ok, 0}
+  defp max_ms(ms), do: int_in(:max_ms, ms, 1..86_400_000)
+
+  defp decode_processor(nil), do: {:ok, ""}
+  defp decode_processor(name), do: processor(name)
 
   # The NIF takes paths up to 4095 bytes.
   defp decode_path(path) do

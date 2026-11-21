@@ -59,6 +59,36 @@ Other findings:
   launches it named for 127.0.0.1 and goes through `iproxy` to port 9101
   (FMutate's recipe).
 
+## Streaming decode (`decode_stream/3`)
+
+Added after the device runs above, while device audio was paused: it has
+run on the host only. `decode/2` now runs on it, so the decode rows above
+predate it too.
+
+Measured on the Mac (M4 Pro, macOS 27.0.1), 5-minute 44.1 kHz stereo
+files (a 1 kHz tone), chunks of 4096 frames, a window of 4:
+
+| | WAV | M4A (AAC 128k, `mono: true`) | MP3 (lame 192k) |
+|--|--|--|--|
+| C, `test/c/mai_apple_test.c` (-O2): whole file | 13,230,000 frames, 52 ms; footprint +0.2 MB (the whole PCM: 100.9 MB) | 13,230,000 frames, 476 ms; +0.2 MB (50.5 MB) | 13,230,000 frames, 804 ms; +0.1 MB (100.9 MB) |
+| C: chunk buffers alive at once | 5 (the window + the one filling) | 5 | 5 |
+| C: cancel a third of the way in, until the codec is released | 0.04-1.5 ms | 0.07-0.18 ms | 0.04-10 ms |
+| BEAM, `test/host_nif_smoke.exs` (the real NIF, an owner reading and acking each chunk): whole file | 2,245 ms; binary memory +0.4 MB, RSS +0.8 MB | 2,023 ms; +0.3 MB, +0.8 MB | 2,595 ms; +0.5 MB, +2.5 MB |
+| BEAM: `decode_cancel/1` to `:decode_cancelled` in the owner's mailbox | 0.48 ms | 1.11 ms | 0.34 ms |
+
+Under ASan the footprint grows with the decode (its quarantine keeps the
+freed chunks), so CI checks the footprint bound (< 24 MB) on an -O2 build.
+In the core's host test (`test/c/mai_core_test.c`, also under TSan) a
+cancel ends a decode waiting for an ack in ~0.02 ms, and one busy decoding
+at its next push.
+
+Pending on devices (MOB-546), with `AudioIoSpike.Probe.decode_stream_all/0`
+(part of `run_all/0`): the Android `AMediaCodec` loop on its own thread
+(cancel per codec buffer, `durationUs` as the stated length, HE-AAC's
+doubled rate), and the iOS build of the same ExtAudioFile code the host
+runs. Decoding plays nothing, but the phones stay untouched while device
+audio is paused.
+
 # The spike (MOB-531, phase 1)
 
 The question: can one Mob plugin own the audio streams on Android and iOS
@@ -282,6 +312,9 @@ Left for the full plugin:
 
 See `AGENTS.md` (Testing): deploy `example/` and run
 `AudioIoSpike.Probe.run_all()` (or `output/3`, `input/2`, `tone/3`,
-`loopback/2`, `decode_all/0`) through `scripts/rpc.exs`; on an iPhone with
-`--iphone <udid>`. (The spike's file-triggered probe described above is
-gone.)
+`loopback/2`, `decode_all/0`, `decode_stream_all/0`) through
+`scripts/rpc.exs`; on an iPhone with `--iphone <udid>`. (The spike's
+file-triggered probe described above is gone.) The streaming decode's
+host numbers: the `macos-coreaudio` steps of `.github/workflows/test.yml`
+(`mai_apple_test.c` at -O2 with `MAI_APPLE_TEST_NO_HARDWARE=1`, and
+`test/host_nif_smoke.exs`).

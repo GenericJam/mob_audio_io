@@ -42,6 +42,25 @@
  *   mai_post          the stream's audio thread only (single producer): from
  *                     render or capture.
  *   mai_now_ns        any thread, real-time safe.
+ *
+ * File decodes: MobAudioIo.decode_stream(path, owner, processor: "name")
+ * feeds a processor the decoded PCM instead of the owner, so C analysis of
+ * a file never passes through the BEAM. Each decode runs on a thread of its
+ * own and calls, all on that thread and in this order:
+ *   stream_event(ctx, decode, MAI_EVENT_STARTED, t)  t->rate: the file's,
+ *                                                    t->channels: 1 with mono
+ *   capture(ctx, in, frames, t)   per chunk; t->frame: the chunk's first
+ *                                 frame in the file, t->present_ns 0
+ *   stream_event(ctx, decode, MAI_EVENT_STOPPED, t)  after the last chunk,
+ *                                 whether the decode finished, failed or
+ *                                 was cancelled; t->frame: frames delivered
+ * `decode` is the decode's id (never a stream's; mai_post to it answers
+ * MAI_ERR_NOT_OPEN). The decode thread is not real-time: there capture may
+ * allocate, lock or log, and the decode waits for it. A processor used by
+ * several decodes or streams at once gets their calls concurrently, each
+ * on its own thread; capture carries no id, so per-decode state is the
+ * processor's to key (a thread-local set at STARTED, say). The processor
+ * is pinned (mai_unregister answers MAI_ERR_BUSY) until STOPPED.
  */
 #ifndef MOB_AUDIO_IO_H
 #define MOB_AUDIO_IO_H

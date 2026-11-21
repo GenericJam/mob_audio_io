@@ -140,6 +140,31 @@ defmodule AudioIoSpike.Probe do
     })
   end
 
+  @doc """
+  `decode_stream/3` on the bundled files: chunks of 1024 frames within a
+  window of 2 (the end, the chunk count, ms, whether they make the same
+  PCM as `decode/2`), a cancel after the first chunk (its answer, what
+  arrived after it, ms until `:decode_cancelled`), a processor
+  (`"mai_silence"`) taking the chunks, and `max_ms: 100` refusing a file.
+  """
+  @spec decode_stream_all() :: map()
+  def decode_stream_all do
+    dir = audio_dir()
+    m4a = Path.join(dir, "tone660.m4a")
+
+    files =
+      for name <- ["a440_stereo.wav", "tone1k.mp3", "tone660.m4a"], into: %{} do
+        {name, stream_summary(Path.join(dir, name))}
+      end
+
+    Map.merge(files, %{
+      "cancel" => cancel_summary(m4a),
+      "processor" => stream_end(m4a, processor: "mai_silence"),
+      "max_ms 100" => stream_end(m4a, max_ms: 100),
+      "missing" => stream_end(Path.join(dir, "none.wav"), [])
+    })
+  end
+
   @doc "What the plugin and the app's C see: devices, processors, registrations, the ABI."
   @spec view() :: map()
   def view do
@@ -153,7 +178,7 @@ defmodule AudioIoSpike.Probe do
     }
   end
 
-  @doc "The whole verification: self-test, view, 60 s output and input, tone, loopback, decode."
+  @doc "The whole verification: self-test, view, 60 s output and input, tone, loopback, decode, decode_stream."
   @spec run_all(pos_integer()) :: map()
   def run_all(seconds \\ 60) do
     %{
@@ -163,7 +188,8 @@ defmodule AudioIoSpike.Probe do
       input: input(seconds),
       tone: tone(10),
       loopback: loopback(15),
-      decode: decode_all()
+      decode: decode_all(),
+      decode_stream: decode_stream_all()
     }
   end
 
@@ -214,6 +240,58 @@ defmodule AudioIoSpike.Probe do
     case MobAudioIo.decode(path, mono: true) do
       {:ok, pcm} -> %{channels: pcm.channels, frames: pcm.frames, rms_db: rms_db(pcm.data)}
       error -> error
+    end
+  end
+
+  defp stream_summary(path) do
+    t0 = System.monotonic_time(:microsecond)
+
+    with {:ok, d} <- MobAudioIo.decode_stream(path, self(), chunk_frames: 1024, window: 2) do
+      {chunks, last} = collect_stream(d, [])
+      ms = div(System.monotonic_time(:microsecond) - t0, 1000)
+      data = chunks |> Enum.reverse() |> IO.iodata_to_binary()
+      same = match?({:ok, %{data: ^data}}, MobAudioIo.decode(path))
+      %{end: last, chunks: length(chunks), ms: ms, same_as_decode: same}
+    end
+  end
+
+  defp cancel_summary(path) do
+    with {:ok, d} <- MobAudioIo.decode_stream(path, self(), chunk_frames: 1024, window: 1) do
+      receive do
+        {:mob_audio_io, :decoded, ^d, _} -> :ok
+      after
+        5_000 -> :ok
+      end
+
+      t0 = System.monotonic_time(:microsecond)
+      cancel = MobAudioIo.decode_cancel(d)
+      {chunks, last} = collect_stream(d, [])
+      us = System.monotonic_time(:microsecond) - t0
+      %{cancel: cancel, end: last, chunks_after: length(chunks), ms: r(us / 1000)}
+    end
+  end
+
+  defp stream_end(path, opts) do
+    with {:ok, d} <- MobAudioIo.decode_stream(path, self(), opts) do
+      {chunks, last} = collect_stream(d, [])
+      %{end: last, chunks: length(chunks)}
+    end
+  end
+
+  # A decode's chunks (newest first, each acknowledged) and its end.
+  defp collect_stream(d, acc) do
+    receive do
+      {:mob_audio_io, :decode_started, ^d, _} ->
+        collect_stream(d, acc)
+
+      {:mob_audio_io, :decoded, ^d, chunk} ->
+        _ = MobAudioIo.decode_ack(d)
+        collect_stream(d, [chunk | acc])
+
+      {:mob_audio_io, kind, ^d, info} ->
+        {acc, {kind, info}}
+    after
+      30_000 -> {acc, :timeout}
     end
   end
 
