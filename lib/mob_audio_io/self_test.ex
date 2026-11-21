@@ -49,7 +49,7 @@ defmodule MobAudioIo.SelfTest do
       {:error, :permission} when direction == :input ->
         :not_permitted
 
-      {:error, :unsupported} ->
+      {:error, :unsupported} when direction == :output ->
         {:fail, "mob_audio_io_nif is not linked into this build (open answered :unsupported)"}
 
       {:error, reason} ->

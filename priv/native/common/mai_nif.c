@@ -18,7 +18,7 @@
  *
  *   {:mob_audio_io, :started, id, info}         opened, or reopened (info.reopened)
  *   {:mob_audio_io, :stopped, id, %{reason: r, posts_dropped: n}}
- *                                               r: :closed | :device_lost | :interrupted | :owner_exit
+ *                                               r: :closed | :device_lost | :interrupted | :route_changed | :owner_exit
  *   {:mob_audio_io, :device_lost, id, %{}}      the device went away; reopening follows
  *   {:mob_audio_io, :interrupted, id, %{}}      iOS session interruption began
  *   {:mob_audio_io, :resumed, id, %{}}          ... ended (a :started follows)
@@ -170,8 +170,8 @@ static ERL_NIF_TERM stopped_info(ErlNifEnv *env, const char *reason, uint32_t dr
 /* {:mob_audio_io, kind, id, payload} to the stream's owner (unless
  * `to_owner` is false) and, when `log`, the logger. From a NIF call (`env`
  * process-bound, from_thread false) or the event thread (`env` its message
- * env, cleared by the send). */
-static void notify_to(ErlNifEnv *env, bool from_thread, mai_stream *s, const char *kind, ERL_NIF_TERM payload,
+ * env, cleared by the send). Whether the owner got it. */
+static bool notify_to(ErlNifEnv *env, bool from_thread, mai_stream *s, const char *kind, ERL_NIF_TERM payload,
                       bool log, bool to_owner) {
     ERL_NIF_TERM msg = enif_make_tuple4(env, atom(env, "mob_audio_io"), atom(env, kind), enif_make_int(env, s->id),
                                         payload);
@@ -188,10 +188,10 @@ static void notify_to(ErlNifEnv *env, bool from_thread, mai_stream *s, const cha
     }
     if (!to_owner) {
         if (from_thread) enif_clear_env(env);
-        return;
+        return false;
     }
-    if (from_thread) enif_send(NULL, &owner, env, msg);
-    else enif_send(env, &owner, NULL, msg);
+    if (from_thread) return enif_send(NULL, &owner, env, msg) != 0;
+    return enif_send(env, &owner, NULL, msg) != 0;
 }
 
 static void notify(ErlNifEnv *env, bool from_thread, mai_stream *s, const char *kind, ERL_NIF_TERM payload,
@@ -234,7 +234,9 @@ static bool any_open_locked(void) {
 }
 
 /* Deliver what the processor queued, in order (or count it, with no owner
- * to deliver to). The stream must be stopped: no producer is left. */
+ * to deliver to, or when the send fails: the owner died before its monitor
+ * fired). The stream must be stopped, or this is the event thread's
+ * periodic drain: one consumer. */
 static uint32_t drain_posts_locked(ErlNifEnv *env, bool from_thread, mai_stream *s, bool deliver) {
     uint32_t dropped = 0;
     mai_msg m;
@@ -243,11 +245,20 @@ static uint32_t drain_posts_locked(ErlNifEnv *env, bool from_thread, mai_stream 
             dropped++;
             continue;
         }
-        notify(env, from_thread, s, "post", binary_of(env, m.data, m.len), false);
+        if (!notify_to(env, from_thread, s, "post", binary_of(env, m.data, m.len), false, true)) dropped++;
         if (from_thread) enif_clear_env(env);
     }
     if (dropped) atomic_fetch_add(&s->posts_dropped, dropped);
     return dropped;
+}
+
+/* Stop the platform stream for `reason` (device lost, interrupted, a
+ * rebuild): what the processor queued before it reaches the owner first,
+ * then :stopped. */
+static void stop_and_report_locked(ErlNifEnv *env, mai_stream *s, const char *reason) {
+    stop_stream_locked(s);
+    uint32_t dropped = drain_posts_locked(env, true, s, true);
+    notify(env, true, s, "stopped", stopped_info(env, reason, dropped), true);
 }
 
 /* Close the stream and free its slot: stops the platform stream, delivers
@@ -271,46 +282,68 @@ static void free_stream_locked(ErlNifEnv *env, bool from_thread, mai_stream *s, 
 
 /* ── Event thread ──────────────────────────────────────────────────────── */
 
-static void try_reopen_locked(ErlNifEnv *env, mai_stream *s, int64_t now, const char *why) {
+/* Open the platform stream again. On failure: `retry` schedules another
+ * try with backoff; without it the stream stays interrupted (an iOS
+ * session another app or a call may still hold) until the interruption's
+ * end or the next return to the foreground. */
+static bool try_reopen_locked(ErlNifEnv *env, mai_stream *s, int64_t now, const char *why, bool retry) {
     const char *err = start_stream_locked(s);
     if (!err) {
         atomic_fetch_add(&s->reopens, 1);
-        s->interrupted = false;
         s->next_reopen_ns = 0;
         s->reopen_failures = 0;
+        /* the end of an interruption whose "ended" never came */
+        if (s->interrupted) notify(env, true, s, "resumed", empty_map(env), true);
+        s->interrupted = false;
         notify(env, true, s, "started", started_info(env, s, true), true);
-        return;
+        return true;
     }
-    /* back off: 0.5 s, 1 s, 2 s ... 8 s */
-    int64_t wait = REOPEN_RETRY_NS << (s->reopen_failures < 4 ? s->reopen_failures : 4);
-    s->next_reopen_ns = now + (wait < REOPEN_RETRY_MAX_NS ? wait : REOPEN_RETRY_MAX_NS);
-    s->reopen_failures++;
+    if (retry) {
+        /* back off: 0.5 s, 1 s, 2 s ... 8 s */
+        int64_t wait = REOPEN_RETRY_NS << (s->reopen_failures < 4 ? s->reopen_failures : 4);
+        s->next_reopen_ns = now + (wait < REOPEN_RETRY_MAX_NS ? wait : REOPEN_RETRY_MAX_NS);
+        s->reopen_failures++;
+    } else {
+        s->interrupted = true;
+        s->next_reopen_ns = 0;
+    }
     ERL_NIF_TERM k[3] = {atom(env, "reason"), atom(env, "detail"), atom(env, "while")};
     ERL_NIF_TERM v[3] = {atom(env, err), string_term(env, s->last_error), atom(env, why)};
     notify(env, true, s, "error", map_of(env, k, v, 3), true);
+    return false;
 }
 
 static void handle_pending_locked(ErlNifEnv *env, mai_stream *s, uint32_t pf, int64_t now) {
     if (pf & MAI_PF_INTERRUPTED) {
+        bool was_running = s->be != NULL;
         stop_stream_locked(s);
         s->interrupted = true;
+        s->next_reopen_ns = 0;
         mai__event(s, MAI_EVENT_INTERRUPTED);
         notify(env, true, s, "interrupted", empty_map(env), true);
-        notify(env, true, s, "stopped", stopped_info(env, "interrupted", 0), true);
+        if (was_running) {
+            uint32_t dropped = drain_posts_locked(env, true, s, true);
+            notify(env, true, s, "stopped", stopped_info(env, "interrupted", dropped), true);
+        }
     }
-    if ((pf & MAI_PF_RESUMED) && (s->interrupted || !s->be)) {
-        /* the interruption ended, or the app came back to the foreground
-         * after one that never sent its end */
+    if ((pf & MAI_PF_RESUMED) && s->interrupted) {
+        /* the interruption's end (iOS says it may resume): retried with
+         * backoff if the session isn't ours yet */
         notify(env, true, s, "resumed", empty_map(env), true);
-        s->interrupted = false; /* (a failed reopen is retried from here on) */
+        s->interrupted = false;
         s->reopen_failures = 0;
-        if (!s->be) try_reopen_locked(env, s, now, "resume");
+        try_reopen_locked(env, s, now, "resume", true);
+    } else if ((pf & MAI_PF_FOREGROUND) && s->interrupted) {
+        /* back in the foreground (or a stale "began" from a suspension)
+         * with an interruption whose end never came: one try, :resumed
+         * and :started if it works. A call still going keeps the stream
+         * interrupted, with no retry loop. */
+        try_reopen_locked(env, s, now, "foreground", false);
     }
     if (pf & MAI_PF_DEVICE_LOST) {
         notify(env, true, s, "device_lost", empty_map(env), true);
-        stop_stream_locked(s);
-        notify(env, true, s, "stopped", stopped_info(env, "device_lost", 0), true);
-        if (!s->interrupted) try_reopen_locked(env, s, now, "device_lost");
+        if (s->be) stop_and_report_locked(env, s, "device_lost");
+        if (!s->interrupted) try_reopen_locked(env, s, now, "device_lost", true);
     }
     if (pf & (MAI_PF_ROUTE | MAI_PF_RESET)) {
         /* ROUTE alone: a new route at the same rate (the unit follows it).
@@ -321,9 +354,9 @@ static void handle_pending_locked(ErlNifEnv *env, mai_stream *s, uint32_t pf, in
         const char *why = !(pf & MAI_PF_RESET) ? "new_route" : (pf & MAI_PF_ROUTE) ? "new_rate" : "media_reset";
         notify(env, true, s, "route_changed", reason_info(env, why), true);
         if ((pf & MAI_PF_RESET) && !s->interrupted) {
-            stop_stream_locked(s);
+            if (s->be) stop_and_report_locked(env, s, "route_changed");
             mai__event(s, MAI_EVENT_ROUTE_CHANGED);
-            try_reopen_locked(env, s, now, "route_changed");
+            try_reopen_locked(env, s, now, "route_changed", true);
         }
     }
 }
@@ -336,7 +369,7 @@ static void poll_stream_locked(ErlNifEnv *env, mai_stream *s, int64_t now, bool 
     }
     if (pf) handle_pending_locked(env, s, pf, now);
     if (!s->be && !s->interrupted && s->next_reopen_ns && now >= s->next_reopen_ns)
-        try_reopen_locked(env, s, now, "retry");
+        try_reopen_locked(env, s, now, "retry", true);
     if (poll_tick && s->be) {
         be_poll(s);
         int32_t x = be_xruns(s);
@@ -675,7 +708,7 @@ static bool pcm_grow(mai_pcm *p, size_t bytes) {
  *   | {:error, reason} | {:error, {reason, detail}} (a dirty IO job) */
 static ERL_NIF_TERM nif_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
-    char path[1024];
+    char path[4096]; /* (MobAudioIo.decode/2 refuses longer paths) */
     ErlNifUInt64 max_bytes;
     char mono[8];
     if (!get_string(env, argv[0], path, sizeof path) || !path[0] || !enif_get_uint64(env, argv[1], &max_bytes) ||

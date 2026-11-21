@@ -44,12 +44,14 @@ static const char *be_load(void) {
     return NULL;
 }
 
-/* The session's output latency plus one IO buffer, in ns: what a rendered
- * frame waits after AudioTimeStamp.mHostTime before it is heard. */
+/* The session's output latency in ns: what a frame waits after its
+ * AudioTimeStamp.mHostTime (the IO cycle's output time) before it is heard
+ * (the convention of Ableton Link's LinkHut and The Amazing Audio Engine;
+ * latency_ms in status/0 adds the IO buffer, the wait from the render call). */
 static int64_t session_out_latency_ns(void) {
     @autoreleasepool {
         AVAudioSession *as = [AVAudioSession sharedInstance];
-        return (int64_t)((as.outputLatency + as.IOBufferDuration) * 1e9);
+        return (int64_t)(as.outputLatency * 1e9);
     }
 }
 
@@ -75,11 +77,11 @@ static void observe_session(void) {
                   }
                   /* A "began" delivered because the app was suspended
                    * (iOS 14.5+) is stale: the interruption may be long over
-                   * and no "ended" will follow. Rebuild right away. */
+                   * and no "ended" will follow. Try to rebuild right away. */
                   NSNumber *reason = n.userInfo[AVAudioSessionInterruptionReasonKey];
                   bool suspended =
                       reason && reason.unsignedIntegerValue == AVAudioSessionInterruptionReasonAppWasSuspended;
-                  flag_all(MAI_PF_INTERRUPTED | (suspended ? MAI_PF_RESUMED : 0));
+                  flag_all(MAI_PF_INTERRUPTED | (suspended ? MAI_PF_FOREGROUND : 0));
                 }];
     /* An interruption whose "ended" never came (the app was in the
      * background when it ended): try again when the app is back. */
@@ -88,7 +90,7 @@ static void observe_session(void) {
                      queue:nil
                 usingBlock:^(NSNotification *n) {
                   (void)n;
-                  flag_all(MAI_PF_RESUMED);
+                  flag_all(MAI_PF_FOREGROUND);
                 }];
     [nc addObserverForName:AVAudioSessionRouteChangeNotification
                     object:as

@@ -42,17 +42,18 @@ defmodule MobAudioIo do
       sharing:, direction:, reopened:}`: the stream runs (again, after a
       reopen, with `reopened: true`).
     * `:stopped`, `%{reason: :closed | :device_lost | :interrupted |
-      :owner_exit, posts_dropped: n}`. Posts the processor queued before a
-      close reach the owner first; `posts_dropped` counts those that could
-      not (the owner had exited).
+      :route_changed | :owner_exit, posts_dropped: n}`. Posts the processor
+      queued before a stop reach the owner first; `posts_dropped` counts
+      those that could not (the owner had exited).
     * `:device_lost`, `%{}`: the device went away (headphones, USB, a
       Bluetooth headset). The plugin reopens on the new route; `:started`
       follows.
     * `:interrupted`, `%{}` and `:resumed`, `%{}`: iOS session
       interruptions (a call, Siri, another app). After `:resumed` the stream
       reopens and `:started` follows. An interruption that never sends its
-      end (the app was suspended) resumes when the app is back in the
-      foreground.
+      end (the app was suspended) gets one reopen try when the app is back
+      in the foreground (`:resumed`, `:started` if it works; an `:error`
+      and the stream stays interrupted if a call still holds the session).
     * `:route_changed`, `%{reason: :new_route | :new_rate | :media_reset}`:
       a new route. The stream is rebuilt for a new rate or a media-services
       reset.
@@ -332,7 +333,8 @@ defmodule MobAudioIo do
   @spec decode(Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def decode(path, opts \\ []) when is_binary(path) and is_list(opts) do
     with {:ok, max_bytes, mono} <- decode_options(opts),
-         {:ok, pcm} <- backend().decode(Path.expand(path), max_bytes, mono) do
+         {:ok, path} <- decode_path(path),
+         {:ok, pcm} <- backend().decode(path, max_bytes, mono) do
       Logger.info(
         "[mob_audio_io] decoded #{Path.basename(path)}: #{pcm.frames} frames, #{pcm.channels} ch at #{pcm.rate} Hz"
       )
@@ -451,7 +453,10 @@ defmodule MobAudioIo do
   end
 
   defp decode_options(opts) do
-    case Enum.find(opts, fn {key, _} -> key not in [:max_bytes, :mono] end) do
+    case Enum.find(opts, fn
+           {key, _} -> key not in [:max_bytes, :mono]
+           _ -> true
+         end) do
       nil ->
         max_bytes = Keyword.get(opts, :max_bytes, @default_max_bytes)
         mono = Keyword.get(opts, :mono, false)
@@ -469,6 +474,15 @@ defmodule MobAudioIo do
 
       {key, _} ->
         {:error, {:invalid_option, key}}
+
+      _ ->
+        {:error, {:invalid_option, :opts}}
     end
+  end
+
+  # The NIF takes paths up to 4095 bytes.
+  defp decode_path(path) do
+    expanded = Path.expand(path)
+    if byte_size(expanded) < 4096, do: {:ok, expanded}, else: {:error, {:invalid_option, :path}}
   end
 end

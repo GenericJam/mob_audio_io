@@ -47,10 +47,11 @@
 /* Pending work for the event thread, set from any thread (atomic or). */
 #define MAI_PF_DEVICE_LOST 0x01u  /* the platform stream disconnected */
 #define MAI_PF_INTERRUPTED 0x02u  /* iOS: interruption began */
-#define MAI_PF_RESUMED 0x04u      /* iOS: interruption ended, or the app came back to the foreground */
+#define MAI_PF_RESUMED 0x04u      /* iOS: interruption ended */
 #define MAI_PF_ROUTE 0x08u        /* a new route */
 #define MAI_PF_RESET 0x10u        /* iOS: the rate changed or media services were reset: rebuild */
 #define MAI_PF_OWNER_DOWN 0x20u   /* the owner exited: close */
+#define MAI_PF_FOREGROUND 0x40u   /* iOS: back in the foreground (or a stale suspended "began"): one reopen try */
 
 /* Directions: bits, so a duplex stream is both. */
 #define MAI_DIR_OUT 1

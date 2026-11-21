@@ -225,6 +225,10 @@ defmodule MobAudioIoTest do
       assert {:error, :unsupported} = MobAudioIo.decode(Path.join(dir, "x.mp3"))
       assert {:error, {:invalid_option, :max_bytes}} = MobAudioIo.decode(path, max_bytes: 0)
       assert {:error, {:invalid_option, :mono}} = MobAudioIo.decode(path, mono: 1)
+      assert {:error, {:invalid_option, :opts}} = MobAudioIo.decode(path, [:mono])
+
+      assert {:error, {:invalid_option, :path}} =
+               MobAudioIo.decode("/" <> String.duplicate("a", 4100))
     end
   end
 

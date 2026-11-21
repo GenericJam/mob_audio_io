@@ -53,7 +53,9 @@
 extern "C" {
 #endif
 
-/* Bumped on any incompatible change to the structs or functions below. */
+/* Bumped on any incompatible change to the structs or functions below.
+ * Version 1 is the layout first released (mob_audio_io 0.1.0); the
+ * unreleased spike's mai_time had no present_ns and isn't compatible. */
 #define MAI_ABI_VERSION 1
 
 #define MAI_NAME_MAX 48   /* processor name, bytes, including the NUL */
