@@ -191,6 +191,10 @@ Mac's audio and say nothing about a phone.
   over unchanged.
 - Processors load lazily (gap 5): `open/3` should take the app's NIF module
   and load it.
+- Magpie on iPhone also needs mob_midi's C interface on CoreMIDI
+  (MOB-543): its engine sends and receives MIDI through `mob_midi.h`, which
+  answers `MOB_MIDI_ERR_UNSUPPORTED` on iOS today. Independent of this
+  plugin.
 
 ## How to reproduce
 
