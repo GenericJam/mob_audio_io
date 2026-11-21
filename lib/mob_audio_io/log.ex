@@ -1,0 +1,41 @@
+defmodule MobAudioIo.Log do
+  @moduledoc """
+  Logs what the native side reports, with a `[mob_audio_io]` prefix.
+
+  Native code can't reach Logger (and so not Sloppy Joe's `logs`), so the
+  NIF's event thread sends this process a copy of every stream message but
+  `:post`. Started, unsupervised and unlinked, by the first
+  `MobAudioIo.Native.open/3`; it lives for the app's life.
+  """
+  use GenServer
+
+  require Logger
+
+  @doc "Start the logger if needed and point the NIF at it."
+  @spec attach() :: :ok
+  def attach do
+    pid =
+      case GenServer.start(__MODULE__, nil, name: __MODULE__) do
+        {:ok, pid} -> pid
+        {:error, {:already_started, pid}} -> pid
+      end
+
+    :mob_audio_io_nif.set_logger(pid)
+  end
+
+  @impl true
+  def init(nil), do: {:ok, nil}
+
+  @impl true
+  def handle_info({:mob_audio_io, kind, stream, info}, state) do
+    Logger.log(level(kind), "[mob_audio_io] stream #{stream} #{kind} #{inspect(info)}")
+    {:noreply, state}
+  end
+
+  def handle_info(_other, state), do: {:noreply, state}
+
+  @doc false
+  @spec level(atom()) :: Logger.level()
+  def level(kind) when kind in [:error, :device_lost, :xrun, :interrupted], do: :warning
+  def level(_kind), do: :info
+end

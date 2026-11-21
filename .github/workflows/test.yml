@@ -1,0 +1,103 @@
+name: tests
+
+# The plugin's host-side Elixir surface (the gate mob core runs: compile,
+# format, credo, tests with the Fake, the manifest check) plus the native
+# code: the C core's host test runs inside `mix test`; the two jobs below
+# compile each platform's NIF with that platform's compiler and check that
+# every function priv/include/mob_audio_io.h declares is defined in it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }}
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: '1.19'
+            otp: '28'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+
+      - name: Cache deps + _build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
+
+      - run: mix deps.get
+      - run: mix deps.compile
+      - run: mix compile --warnings-as-errors
+
+      - name: Format check
+        run: mix format --check-formatted
+
+      - name: Credo (strict)
+        run: mix credo --strict
+
+      - name: Tests (Fake backend + the C core's host test)
+        run: mix test
+
+      - name: Manifest
+        run: mix mob.validate_plugin
+
+  android-native:
+    name: Android NIF (NDK clang, arm64 + x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: '1.19'
+          otp-version: '28'
+
+      - name: Compile + ABI symbols
+        run: |
+          ERTS=$(erl -noshell -eval 'io:format("~s/erts-~s/include",[code:root_dir(),erlang:system_info(version)]),halt().')
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          for triple in aarch64-linux-android26 x86_64-linux-android26; do
+            "$BIN/$triple-clang" -Wall -Wextra -Werror -DSTATIC_ERLANG_NIF_LIBNAME=mob_audio_io_nif \
+              -I"$ERTS" -c priv/native/android/mob_audio_io_nif.c -o "$triple.o"
+            scripts/check_abi_symbols.sh "$triple.o" "$BIN/llvm-nm"
+          done
+
+  ios-native:
+    name: iOS NIF (Xcode clang, device + simulator)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Erlang headers
+        run: brew install erlang
+
+      - name: Compile + ABI symbols
+        run: |
+          ERTS=$(erl -noshell -eval 'io:format("~s/erts-~s/include",[code:root_dir(),erlang:system_info(version)]),halt().')
+          for sdk in iphoneos iphonesimulator; do
+            xcrun -sdk "$sdk" clang -arch arm64 -mios-version-min=15.0 -fobjc-arc \
+              -Wall -Wextra -Werror -DSTATIC_ERLANG_NIF_LIBNAME=mob_audio_io_nif \
+              -I"$ERTS" -c priv/native/ios/mob_audio_io_nif.m -o "$sdk.o"
+            scripts/check_abi_symbols.sh "$sdk.o" "$(xcrun -f nm)"
+          done
