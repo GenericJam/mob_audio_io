@@ -1,4 +1,65 @@
-# mob_audio_io spike (MOB-531, phase 1)
+# mob_audio_io: device verification
+
+What the example app (`example/`, `com.genericjam.audioiospike`) measured
+with the full plugin, through `AudioIoSpike.Probe.run_all/0` over RPC. A
+full run: the self-test, the devices and processors, 60 s of output
+(`spike_click`, posting a message per click), 60 s of input (`tone_loop`,
+the plugin's meter and a pitch estimate once a second), 10 s of a 1 kHz tone
+played through the speaker and heard back through the microphone (duplex
+`tone_loop`), 15 s of a burst a second whose acoustic round trip the capture
+times (duplex `loop_latency`), and decoding a WAV, an MP3 and an M4A shipped
+in `priv/audio`. Worst-case counters are zeroed 1 s after each open.
+
+**Only the moto g power column is a full run of the final build** (main
+8f1905e, PRs #1-#3). The simulator column is a full run with the final iOS
+code. At 10:33 UTC Kevin paused all device audio while the moto e and iPhone
+SE runs of the final build were pending: their columns come from earlier
+builds and shorter runs (named in the "build" row) and the whole columns
+need a re-run of the final build once audio may resume (MOB-546).
+
+## Results
+
+| | moto g power 2021 (Android 11, API 30) | moto e (Android 10, API 29, armv7a) | iPhone SE 3rd gen (iOS 27.2.1) | iOS simulator (iPhone Air, iOS 27.0) |
+|--|--|--|--|--|
+| build | final (main 8f1905e) | PR #3 before review fixes (agent run) | PR #2 at b84e840 | final iOS code (e74cd0e) |
+| self-test (output + input) | pass | n/a | pass (output; input not permitted yet) | pass |
+| output 60 s, `spike_click` | 13,535 callbacks, 0 xruns, cb_frames 240 (16-240), cb_max 740 µs, gap_max 10.6 ms, latency 10.0 ms, present :estimate, 123/123 posts | 5 s `mai_sine`: 1 xrun, buffer 480 → 720 | 3 s: cb_frames 240, 0 xruns, gap_max 5.06 ms, latency 16.5 ms, present :timestamp | 5,254 callbacks, 0 xruns, cb_frames 557-558, cb_max 8 µs, gap_max 11.7 ms, 122 posts |
+| input 60 s | 16,620 callbacks, 0 xruns, cb_frames 192 (64-192), cb_max 243 µs, gap_max 5.7 ms, input latency 4.0 ms; ambient RMS median -74.3 dBFS, peak -57.8 | 10 s: 2,105 callbacks, 0 xruns, RMS -72..-76 dBFS | *pending* (microphone permission) | 5,328 callbacks, 0 xruns, RMS median -60.0 dBFS, peak -38.3 |
+| tone 1 kHz, speaker → mic | 1000.0 Hz median (999.98-1000.02) in 20/20 windows, -9.6 dBFS | *pending* | *pending* | not heard (the Mac's speaker and mic; RMS -59.6) |
+| duplex | 3,550 callbacks, 0 xruns, 0 input underflows, cb_max 321 µs, input latency 12 ms | 10 s: 0 xruns, 0 underflows, cb_max 303 µs | *pending* | 0 xruns, 19 underflows in 15 s (the simulator alternates 557/558-frame blocks) |
+| loopback round trip | median 108.6 ms (8 of 16 bursts heard; spread 5-452 ms: the detector is unreliable against this phone's AGC) | *pending* | *pending* | median 37.5 ms (37.5-38.1, 15 of 16 heard); presentation-time gap 37.3 ms |
+| decode WAV 44.1 kHz stereo | 88,200 frames, 2 ch, -24.1 dBFS | 88,200 frames | 88,200 frames, 24 ms | 88,200 frames, 17 ms |
+| decode MP3 48 kHz mono | 96,000 frames (exact) | 66,150 at 22.05 kHz (agent's file) | 97,920 (ExtAudioFile keeps the encoder padding) | 97,920 |
+| decode M4A 48 kHz stereo | 96,256 frames | | 96,000 (exact) | 96,000 |
+| decode errors | missing: `{:not_found, ...}`; 100 kB cap: `:too_large` | same | same | same |
+| devices | in: 14, 15 builtin_mic; out: 2 speaker, 3 earpiece | in: 13, 14; out: 2 earpiece, 3 speaker | in: "Built-In Microphone" (an inactive PlayAndRecord session lists it); out: Speaker | MicrophoneBuiltIn; Speaker |
+| presets | default 6, generic 1, performance 10, unprocessed 9, voice 7 all open (agent run); `:voice` heard another phone's tone at -36 dBFS (AEC/NS gate the phone's own tone and a quiet room to zeros) | same 5 open | *pending* | `:voice` VoiceChat + VoiceProcessingIO, `:unprocessed` Measurement (agent run) |
+| permission | revoked: input and duplex `{:error, :permission}`, output runs | | prompt shown; `:permission` until allowed | revoked: `:permission`; granted: opens |
+
+Other findings:
+
+* Android's legacy `AudioStreamRecord::read` drops data when a non-blocking
+  float read of a FAST input asks for more than has arrived (android-11, -12
+  and main): duplex reads its input as 16-bit and converts (31 underflows/s
+  before, 0 after).
+* An explicit Android device the audio policy won't route a media stream to
+  (the second mic, the earpiece) is disconnected ~60 ms after each start; the
+  core backs such quick losses off (0.5 s → 8 s) instead of reopening ~7
+  times a second.
+* Both motos are below API 31, so their presentation times are estimates
+  (`present: :estimate`); the AAudio timestamp path (API 31+) is compiled and
+  guarded but hasn't run on hardware (MOB-546).
+* Route change: no headphones were attached. The route and rate-change paths
+  are covered by the macOS CoreAudio CI job and the simulator's session-union
+  run (`:mix` output, then an input stream: Playback → PlayAndRecord with the
+  output running, back to Playback 400 ms after the input closed), not by a
+  physical route change (MOB-546).
+* iPhone RPC: the Mac can't reach the phone's Wi-Fi-named node
+  (EHOSTUNREACH, macOS local-network privacy); `scripts/rpc.exs --iphone`
+  launches it named for 127.0.0.1 and goes through `iproxy` to port 9101
+  (FMutate's recipe).
+
+# The spike (MOB-531, phase 1)
 
 The question: can one Mob plugin own the audio streams on Android and iOS
 while each app keeps its DSP in its own C, linked against the plugin's C
@@ -219,10 +280,8 @@ Left for the full plugin:
 
 ## How to reproduce
 
-See `AGENTS.md` (Testing). In short: `cd example`, zig 0.17.0 on `PATH`,
-lease the device, `mix mob.deploy --native --android --device <serial>`,
-`mix mob.connect --no-iex`, then
-`mix run --no-start scripts/rpc.exs <node> 'AudioIoSpike.Probe.run("spike_click", 60)' 90000`.
-For the iPhone: copy an empty `Documents/mai_probe_request` into the app's
-container with `xcrun devicectl device copy to`, relaunch, and copy
-`Documents/mai_probe_result.txt` back two and a half minutes later.
+See `AGENTS.md` (Testing): deploy `example/` and run
+`AudioIoSpike.Probe.run_all()` (or `output/3`, `input/2`, `tone/3`,
+`loopback/2`, `decode_all/0`) through `scripts/rpc.exs`; on an iPhone with
+`--iphone <udid>`. (The spike's file-triggered probe described above is
+gone.)

@@ -7,7 +7,17 @@ defmodule AudioIoSpike.HomeScreen do
     Mob.Theme.set(theme_to_module(theme))
     # Activated plugins that ship a demo screen show up here automatically —
     # no edits needed when you add or remove one in mob.exs.
-    {:ok, Mob.Socket.assign(socket, theme: theme, plugin_screens: Mob.Plugins.screens())}
+    # The verification's input and duplex streams need the microphone: ask
+    # once at start, after mount (the NIF isn't there in host tests;
+    # mob_audio_io answers {:error, :permission} until it's granted).
+    send(self(), :ask_microphone)
+
+    {:ok,
+     Mob.Socket.assign(socket,
+       theme: theme,
+       plugin_screens: Mob.Plugins.screens(),
+       microphone: :asked
+     )}
   end
 
   def render(assigns) do
@@ -16,8 +26,8 @@ defmodule AudioIoSpike.HomeScreen do
       <Column background={:background} padding={:space_lg}>
         <Image src={logo_src(assigns.theme)} width={120} height={120} content_mode="fit" />
         <Spacer size={16} />
-        <Text text="AudioIoSpike" text_size={:xl} text_color={:on_surface} padding={:space_sm} />
-        <Text text="BEAM running on device" text_size={:sm} text_color={:primary} padding={4} />
+        <Text text="mob_audio_io example" text_size={:xl} text_color={:on_surface} padding={:space_sm} />
+        <Text text={"Microphone: #{assigns.microphone}"} text_size={:sm} text_color={:primary} padding={4} />
         <Spacer size={40} />
         {plugin_section(assigns.plugin_screens)}
         <Spacer size={32} />
@@ -52,6 +62,12 @@ defmodule AudioIoSpike.HomeScreen do
       nil -> {:noreply, socket}
     end
   end
+
+  def handle_info(:ask_microphone, socket),
+    do: {:noreply, Mob.Permissions.request(socket, :microphone)}
+
+  def handle_info({:permission, :microphone, status}, socket),
+    do: {:noreply, Mob.Socket.assign(socket, :microphone, status)}
 
   def handle_info(_message, socket), do: {:noreply, socket}
 
